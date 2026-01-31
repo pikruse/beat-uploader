@@ -1,0 +1,6 @@
+__pycache__/
+.env
+auth/
+*.mp4
+*.log
+.DS_Store
