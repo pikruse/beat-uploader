@@ -1,5 +1,5 @@
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 import librosa
 from moviepy import VideoClip, AudioFileClip
 from scipy.signal import savgol_filter
@@ -7,9 +7,9 @@ import math
 import os
 
 # --- METADATA ---
-TRACK_TITLE = "ORBITAL RESONANCE"
-PRODUCER = "ANOMALY SYSTEM"
-BPM_TEXT = "128 BPM"
+TRACK_TITLE = "KeepItUP"
+PRODUCER = "pk & henryberg"
+BPM_TEXT = "144 bpm"
 
 # --- CONFIG ---
 AUDIO_FILE = "test_audio.mp3"
@@ -25,7 +25,7 @@ ACCENT_COLOR = (0, 0, 0)
 
 # GEOMETRY
 SPHERE_RADIUS = 280
-RING_RADIUS = 380 
+RING_RADIUS = 300
 SUBDIVISIONS = 2
 
 os.makedirs("output", exist_ok=True)
@@ -38,7 +38,10 @@ def normalize(v):
     if norm == 0: return v
     return v / norm
 
+# create icosphere, return vertices and edges of sphere
 def create_icosphere(radius, subdivisions):
+
+    # get vertices, faces
     t = (1.0 + math.sqrt(5.0)) / 2.0
     verts = [
         (-1, t, 0), (1, t, 0), (-1, -t, 0), (1, -t, 0),
@@ -52,6 +55,8 @@ def create_icosphere(radius, subdivisions):
         (3, 9, 4), (3, 4, 2), (3, 2, 6), (3, 6, 8), (3, 8, 9),
         (4, 9, 5), (2, 4, 11), (6, 2, 10), (8, 6, 7), (9, 8, 1)
     ]
+
+    # get middle point of the icosphere
     middle_point_cache = {}
     def get_middle_point(p1_idx, p2_idx):
         key = tuple(sorted((p1_idx, p2_idx)))
@@ -63,6 +68,7 @@ def create_icosphere(radius, subdivisions):
         idx = len(verts) - 1
         middle_point_cache[key] = idx
         return idx
+ 
     for _ in range(subdivisions):
         new_faces = []
         for v1, v2, v3 in faces:
@@ -76,10 +82,12 @@ def create_icosphere(radius, subdivisions):
         faces = new_faces
     final_verts = np.array(verts) * radius
     edges = set()
+
     for f in faces:
         edges.add(tuple(sorted((f[0], f[1]))))
         edges.add(tuple(sorted((f[1], f[2]))))
         edges.add(tuple(sorted((f[2], f[0]))))
+    
     return final_verts, list(edges)
 
 print("Building Geodesic Mesh...")
@@ -153,10 +161,27 @@ def make_frame(t):
     cx, cy = WIDTH // 2, HEIGHT // 2
 
     # --- UI PANELS ---
-    # TOP LEFT: Waveform
+
+    # 1. LOAD FONTS (Do this once at the top of make_frame, or globally)
+    # Ideally, move this OUTSIDE make_frame for performance, but here is fine for testing
+    try:
+        # Load Custom Font (Size 20 for Headers, 14 for Data)
+        title_font = ImageFont.truetype("fonts/oxanium/Oxanium-ExtraLight.ttf", 20)
+        data_font = ImageFont.truetype("fonts/oxanium/Oxanium-Light.ttf", 14)
+        header_font = ImageFont.truetype("fonts/oxanium/Oxanium-Regular.ttf", 12)
+    except IOError:
+        # Fallback if font.ttf isn't found
+        print("Warning: font.ttf not found, using default.")
+        title_font = ImageFont.load_default()
+        data_font = ImageFont.load_default()
+        header_font = ImageFont.load_default()
+
+    # 1. TOP LEFT: Waveform
     tl_x, tl_y = 50, 50
     draw.rectangle([tl_x, tl_y, tl_x+300, tl_y+100], outline=UI_COLOR, width=2)
-    draw.text((tl_x+10, tl_y+5), "TRACK OVERVIEW", fill=UI_COLOR)
+    # Use 'font=' argument
+    draw.text((tl_x+10, tl_y+5), "TRACK OVERVIEW", fill=UI_COLOR, font=header_font)
+    
     wave_y = tl_y + 50
     for i in range(len(global_wave)-1):
         x1 = tl_x + (i/len(global_wave))*300
@@ -167,10 +192,10 @@ def make_frame(t):
     ph_x = tl_x + (t/duration)*300
     draw.line([ph_x, tl_y, ph_x, tl_y+100], fill=(255,0,0), width=2)
 
-    # TOP RIGHT: Spectrum
+    # 2. TOP RIGHT: Spectrum
     tr_x, tr_y = WIDTH-350, 50
     draw.rectangle([tr_x, tr_y, tr_x+300, tr_y+100], outline=UI_COLOR, width=2)
-    draw.text((tr_x+10, tr_y+5), "SPECTRUM", fill=UI_COLOR)
+    draw.text((tr_x+10, tr_y+5), "SPECTRUM", fill=UI_COLOR, font=header_font)
     spec = D_db[:, f_idx]
     bars = 32
     bw = 280 / bars
@@ -183,18 +208,20 @@ def make_frame(t):
         bx = tr_x + 10 + i*bw
         draw.rectangle([bx, tr_y+90-h, bx+bw-2, tr_y+90], fill=ACCENT_COLOR)
 
-    # BOTTOM LEFT: Metadata
+    # 3. BOTTOM LEFT: Metadata
     bl_x, bl_y = 50, HEIGHT-150
     draw.rectangle([bl_x, bl_y, bl_x+300, bl_y+100], outline=UI_COLOR, width=2)
-    draw.text((bl_x+10, bl_y+5), "METADATA", fill=UI_COLOR)
-    draw.text((bl_x+10, bl_y+35), TRACK_TITLE, fill=ACCENT_COLOR)
-    draw.text((bl_x+10, bl_y+55), PRODUCER, fill=(80,80,80))
-    draw.text((bl_x+10, bl_y+75), BPM_TEXT, fill=(80,80,80))
+    
+    draw.text((bl_x+10, bl_y+5), "METADATA", fill=UI_COLOR, font=header_font)
+    # Bigger font for Title
+    draw.text((bl_x+10, bl_y+30), TRACK_TITLE, fill=ACCENT_COLOR, font=title_font)
+    draw.text((bl_x+10, bl_y+55), PRODUCER, fill=(80,80,80), font=data_font)
+    draw.text((bl_x+10, bl_y+75), BPM_TEXT, fill=(80,80,80), font=data_font)
 
-    # BOTTOM RIGHT: VU
+    # 4. BOTTOM RIGHT: VU
     br_x, br_y = WIDTH-350, HEIGHT-150
     draw.rectangle([br_x, br_y, br_x+300, br_y+100], outline=UI_COLOR, width=2)
-    draw.text((br_x+10, br_y+5), "OUTPUT LEVELS", fill=UI_COLOR)
+    draw.text((br_x+10, br_y+5), "OUTPUT LEVELS", fill=UI_COLOR, font=header_font)
     s_idx = int(t * sr)
     win = 1024
     s, e = max(0, s_idx-win), min(y_stereo.shape[1], s_idx+win)
@@ -202,43 +229,113 @@ def make_frame(t):
     if e > s:
         lvl_l = min(np.sqrt(np.mean(y_stereo[0, s:e]**2)) * 5.0, 1.0)
         lvl_r = min(np.sqrt(np.mean(y_stereo[1, s:e]**2)) * 5.0, 1.0)
-    draw.text((br_x+10, br_y+40), "L", fill=ACCENT_COLOR)
+        
+    draw.text((br_x+10, br_y+40), "L", fill=ACCENT_COLOR, font=data_font)
     draw_vu_meter(draw, br_x+30, br_y+40, 250, 10, lvl_l)
-    draw.text((br_x+10, br_y+65), "R", fill=ACCENT_COLOR)
+    
+    draw.text((br_x+10, br_y+65), "R", fill=ACCENT_COLOR, font=data_font)
     draw_vu_meter(draw, br_x+30, br_y+65, 250, 10, lvl_r)
 
     # --- 3D SCENE ---
     
-    # 1. STATIC 2D RING (SMOOTH)
-    ring_res = 150
+    # 1. POLAR SPECTRUM RING -> FFT BASED
+    ring_rot_speed = 0.05 # const rotation --> radians/sec
+    current_rot = t * ring_rot_speed 
     ring_pts = []
-    if e > s:
-        chunk = y_mono[s:e]
-        if len(chunk) > 15: chunk = savgol_filter(chunk, 11, 3) 
-        r_idx = np.linspace(0, len(chunk)-1, ring_res).astype(int)
-        r_wave = chunk[r_idx]
-        for i in range(ring_res):
-            ang = (i/ring_res) * 2 * math.pi
-            r = RING_RADIUS + (r_wave[i] * 100)
+
+    # use a larger window for better freq resolution
+    fft_win = 4096 # samples per ring
+    rs = max(0, s_idx - fft_win//2)
+    re = min(y_mono.shape[0], s_idx + fft_win//2)
+
+    # extract fft data for current frame to build ring
+    if re > rs and len(y_mono[rs:re]) == fft_win: 
+        # chunk is the audio from min to max range
+        chunk = y_mono[rs:re] * np.hanning(fft_win) # hanning window attenuates edges to 0
+
+        # FFT
+        spectrum = np.abs(np.fft.rfft(chunk))
+
+        # only get the first ~100 bins (bass/mids) for the visuals
+        spec_len = 120
+        if len(spectrum) > spec_len:
+            spectrum = spectrum[:spec_len]
+
+        # logarithmic scaling
+        spectrum = np.log10(spectrum + 1)
+
+        # smooth the spectrum curve
+        # window must be smaller than array size and odd
+        if len(spectrum) > 11:
+            spectrum = savgol_filter(spectrum, 11, 3) # savgol filter smoothes the curve by fitting polynomials to local windows
+
+        # mirror for loop
+        full_spec = np.concatenate((spectrum, spectrum[::-1]))
+
+        # normalize
+        max_val = np.max(full_spec) + 0.001
+        full_spec = full_spec / max_val
+        full_spec = full_spec ** 3.0 # increase contrast
+
+        # generate points
+        num_pts = len(full_spec)
+        for i in range(num_pts):
+            # map index to radians
+            base_ang = (i / num_pts) * 2 * math.pi
+
+            # apply slow, constant rotation
+            ang = base_ang + current_rot + (math.pi / 2)
+
+            # amplitude
+            amp = full_spec[i]
+
+            # radius = base + frequency magnitude
+            r = RING_RADIUS + (amp * 200)
+
             rx = cx + math.cos(ang) * r
             ry = cy + math.sin(ang) * r
             ring_pts.append((rx, ry))
+        
+        # close the loop
         if len(ring_pts) > 2:
             ring_pts.append(ring_pts[0])
-            draw.line(ring_pts, fill=(0,0,0,255), width=2)
+            draw.line(ring_pts, fill=(0, 0, 0, 255), width = 3)
 
-    # 2. 3D SPHERE (GEODESIC)
+    # 2. 3D SPHERE (Deforming)
     cos_y, sin_y = math.cos(smooth_rot), math.sin(smooth_rot)
     cos_x, sin_x = math.cos(t * 0.2), math.sin(t * 0.2)
     ry = np.array([[cos_y, 0, sin_y], [0, 1, 0], [-sin_y, 0, cos_y]])
     rx = np.array([[1, 0, 0], [0, cos_x, -sin_x], [0, sin_x, cos_x]])
     
-    scale = 1.0 + (smooth_pulse * 0.2)
-    c_verts = BASE_VERTS * scale
+    # 1. Base Breathing (Uniform Scale)
+    base_scale = 1.0 + (smooth_pulse * 0.15)
+    
+    # 2. BASS DEFORMATION (Spikes)
+    # We create a noise mask that stays attached to the geometry
+    # We use a fixed seed (42) so the spikes don't jitter randomly; they are "physical" parts of the sphere
+    noise = np.random.RandomState(42).uniform(0.0, 1.0, size=(len(BASE_VERTS), 1))
+    
+    # Threshold the noise so only ~30% of vertices spike
+    # we treat 'smooth_pulse' as the intensity control
+    spike_intensity = smooth_pulse * 1.5
+    
+    # Only deform if there is bass
+    if spike_intensity > 0.01:
+        # Raise noise to power of 5 to make spikes rare and sharp
+        spikes = (noise ** 5.0) * spike_intensity
+        deformation = 1.0 + spikes
+    else:
+        deformation = 1.0
+        
+    # Apply: Base Geometry * Breathing * Spikes
+    c_verts = BASE_VERTS * base_scale * deformation
+    
+    # 3. Rotate (after deformation so spikes spin with sphere)
     rotated = np.dot(c_verts, ry)
     rotated = np.dot(rotated, rx)
     
     proj = []
+
     for i, v in enumerate(rotated):
         z = v[2]
         f = 800 / (z + 1000)
@@ -251,17 +348,13 @@ def make_frame(t):
         p2 = proj[j]
         avg_z = (p1['z'] + p2['z']) / 2
         
-        # --- SMOOTH DEPTH FOG ---
-        # Normalize Z range roughly from -350 (back) to +350 (front)
+        # Smooth Depth Fog (Same as before)
         norm_z = (avg_z + 350) / 700
-        norm_z = max(0.0, min(1.0, norm_z)) # Clamp
-
-        # Map to Opacity: Back(0.0)->50, Front(1.0)->255
+        norm_z = max(0.0, min(1.0, norm_z))
+        
         min_alpha = 50
         max_alpha = 255
         alpha = int(min_alpha + (norm_z * (max_alpha - min_alpha)))
-
-        # Smooth width transition
         width = 2 if norm_z > 0.6 else 1
             
         draw.line([(p1['x'], p1['y']), (p2['x'], p2['y'])], fill=(0,0,0, alpha), width=width)
@@ -272,4 +365,10 @@ def make_frame(t):
 print("Rendering...")
 video = VideoClip(make_frame, duration=duration if not DURATION_LIMIT else DURATION_LIMIT)
 video = video.with_audio(AudioFileClip(AUDIO_FILE))
-video.write_videofile(OUTPUT_FILE, fps=FPS, codec='libx264', audio_codec='aac', preset='medium', threads=4)
+video.write_videofile(OUTPUT_FILE, 
+                      fps=FPS, 
+                      codec='libx264', 
+                      audio_codec='aac', 
+                      preset='slow', 
+                      threads=4,
+                      bitrate="15000k")
