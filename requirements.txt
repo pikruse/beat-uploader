@@ -1,0 +1,5 @@
+numpy
+Pillow
+librosa
+moviepy>=2.0
+click
