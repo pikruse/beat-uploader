@@ -29,7 +29,7 @@ from youtube_uploader import upload_video
 @click.option("--duration", default=None, type=float, help="Limit audio duration (seconds)")
 @click.option("--output", default=None, help="Video output path (default: output/<title>.mp4)")
 # ── YouTube ──
-@click.option("--privacy", default="unlisted",
+@click.option("--privacy", default="public",
               type=click.Choice(["public", "unlisted", "private"]),
               help="YouTube privacy status (default: unlisted)")
 @click.option("--skip-youtube", is_flag=True, help="Only render video, skip YouTube upload")
@@ -62,11 +62,11 @@ def main(audio, title, producer, bpm, key, tags, beatstars_url,
     print("══════════════════════════════════════")
     print("  BEAT UPLOAD PIPELINE")
     print("══════════════════════════════════════")
-    print(f"  Track    : {title}")
-    print(f"  Producer : {producer}")
-    print(f"  BPM      : {bpm_text}")
-    print(f"  Key      : {key_text}")
-    print(f"  Duration : {dur:.1f}s")
+    print(f"  Track: {title}")
+    print(f"  Producer: {producer}")
+    print(f"  BPM: {bpm_text}")
+    print(f"  Key: {key_text}")
+    print(f"  Duration: {dur:.1f}s")
     if tag_list:
         print(f"  Tags     : {', '.join(tag_list)}")
     if beatstars_url:
@@ -94,14 +94,15 @@ def main(audio, title, producer, bpm, key, tags, beatstars_url,
     video = video.with_audio(AudioFileClip(audio))
     video.write_videofile(
         output, fps=FPS, codec="libx264", audio_codec="aac",
-        threads=4, preset="slow", bitrate="15000k",
+        threads=4, preset="slow",
+        ffmpeg_params=["-crf", "18", "-maxrate", "40M", "-bufsize", "80M"],
     )
     print(f"  Video saved: {output}")
     print()
 
     # ════════════════════════════════════════════════════════
     #  STEP 3 — Upload to YouTube
-    # ════════════════════════════════════════════════════════
+    # ════=═══════════════════════════════════════════════════
     if skip_youtube:
         print("── Skipping YouTube upload (--skip-youtube) ──")
         return
@@ -130,7 +131,7 @@ def main(audio, title, producer, bpm, key, tags, beatstars_url,
 
     print()
     print("══════════════════════════════════════")
-    print(f"  ✅ Done! {url}")
+    print(f"Done! {url}")
     print("══════════════════════════════════════")
 
 

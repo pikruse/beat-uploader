@@ -75,7 +75,7 @@ def main(audio, title, producer, bpm, key, output, scheme, duration):
         audio_codec='aac',
         threads=4,
         preset='slow',
-        bitrate='15000k',
+        ffmpeg_params=['-crf', '18', '-maxrate', '40M', '-bufsize', '80M'],
     )
     print("Done!")
 

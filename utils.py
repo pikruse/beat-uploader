@@ -40,15 +40,15 @@ def generate_description(
         lines.append("")
 
     # ── Title + credit ──
-    lines.append(f'"{title}" — Prod. {producer}')
+    lines.append(f'"{title}" — prod {producer}')
     lines.append("")
 
     # ── Beat info block ──
     lines.append("── Beat Info ──")
-    lines.append(f"Title : {title}")
-    lines.append(f"Prod. : {producer}")
-    lines.append(f"BPM   : {bpm}")
-    lines.append(f"Key   : {key}")
+    lines.append(f"Title: {title}")
+    lines.append(f"Prod: {producer}")
+    lines.append(f"BPM: {bpm}")
+    lines.append(f"Key: {key}")
     lines.append("")
 
     # ── Tag line ──
@@ -72,7 +72,23 @@ def generate_description(
         lines.append("")
 
     # ── Hashtags (YouTube indexes these for search) ──
-    hashtags = ["#typebeat", "#beats", "#instrumental", "#freebeat"]
+    hashtags = ["#typebeat", 
+                "#beats", 
+                "#instrumental", 
+                "#freebeat", 
+                "#prod_pk", 
+                "#pk", 
+                "#glo", 
+                "#digicore", 
+                "#underground",
+                "#hiphop",
+                "#rap",
+                "#trap",
+                "#lofi",
+                "#chill",
+                "#dark",
+                "#emotional",
+                "#melodic"]
     for p in producer.replace(",", " ").split():
         p = p.strip()
         if p:
@@ -90,7 +106,7 @@ def generate_description(
 def format_youtube_title(title: str, producer: str, bpm: str) -> str:
     """Format a standard type-beat YouTube title.
 
-    Example:  [FREE] TimeTraveller, prod pk (148 bpm)
+    Example:  TimeTraveller, prod pk    
     """
     bpm_num = bpm.lower().replace("bpm", "").strip()
-    return f"[FREE] {title}, prod {producer} ({bpm_num} bpm)"
+    return f"{title}, prod {producer}"
