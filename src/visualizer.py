@@ -80,14 +80,28 @@ def smooth_noise_3d(positions, time, frequency=2.0, octaves=3):
 
 
 # ── RENDERER ─────────────────────────────────────────────────
+#
+# The renderer is split into two halves so frames can be drawn in
+# parallel (see src/render.py):
+#
+#   step_state(t)         — advances all temporal smoothing / particle
+#                           state; MUST be called sequentially, one call
+#                           per frame. Returns a picklable state snapshot.
+#   draw_frame(t, state)  — pure function of (t, state); safe to run in
+#                           any process. Only touches audio.waveform_dense
+#                           and audio.sr.
+#
+# render_frame(t) composes the two for simple sequential use.
 
 class VisualizerRenderer:
-    def __init__(self, audio_analyzer, metadata, base_verts, edges, color_scheme):
+    def __init__(self, audio_analyzer, metadata, base_verts, edges, color_scheme,
+                 total_duration=None):
         self.audio = audio_analyzer
         self.meta = metadata          # {'title', 'producer', 'bpm'}
         self.verts = base_verts
         self.edges = edges
         self.cs = color_scheme
+        self.total_dur = total_duration
 
         # Pre-compute vertex normals (unit outward direction)
         norms = np.linalg.norm(base_verts, axis=1, keepdims=True)
@@ -125,6 +139,74 @@ class VisualizerRenderer:
         self.font_sub    = _font("Oxanium-Regular.ttf", 19)
         self.font_tech   = _font("Oxanium-Light.ttf", 17)
         self.font_header = _font("Oxanium-Regular.ttf", 11)
+        self.font_label  = _font("Oxanium-Regular.ttf", 13)
+        self.font_time   = _font("Oxanium-Regular.ttf", 15)
+
+        # Everything that never changes between frames is drawn once here;
+        # draw_frame() starts from a copy instead of redrawing it.
+        self._static_bg = self._build_static_bg()
+        self._glow_sprite = self._build_glow_sprite()
+
+    # ── Precomputed layers ───────────────────────────────────
+
+    def _build_static_bg(self):
+        img = Image.new('RGB', (WIDTH, HEIGHT), FL_BG_DARK)
+        draw = ImageDraw.Draw(img, 'RGBA')
+        self.draw_grid(draw)
+
+        self.draw_rounded_panel(draw, (SPHERE_X, SPHERE_Y, SPHERE_W, SPHERE_H))
+        self.draw_rounded_panel(draw, (SPEC_X, SPEC_Y, SPEC_W, SPEC_H))
+        self.draw_rounded_panel(draw, (PADDING, WAVEFORM_Y, WAVEFORM_W, WAVEFORM_HEIGHT))
+        self.draw_rounded_panel(draw, (VU_X, VU_Y, VU_W, VU_H))
+
+        # Panel headers
+        draw.text((SPEC_X + 12, SPEC_Y + 10), "SPECTRUM",
+                  font=self.font_label, fill=FL_TEXT_DIM)
+        draw.text((PADDING + 14, WAVEFORM_Y + 8), "WAVEFORM",
+                  font=self.font_label, fill=FL_TEXT_DIM)
+        draw.text((SPHERE_X + 52, SPHERE_Y + 20),
+                  f"VISUALIZER · {self.cs['name'].upper()}",
+                  font=self.font_label, fill=FL_TEXT_DIM)
+
+        # VU labels
+        draw.text((VU_X + 28, VU_Y + 8), "L", fill=FL_TEXT_DIM, font=self.font_header)
+        draw.text((VU_X + 76, VU_Y + 8), "R", fill=FL_TEXT_DIM, font=self.font_header)
+
+        # Tech corner brackets in the sphere panel
+        bkt = 30
+        bkt_c = (80, 80, 80, 100)
+        corners = [
+            (SPHERE_X + 12, SPHERE_Y + 12),
+            (SPHERE_X + SPHERE_W - 12, SPHERE_Y + 12),
+            (SPHERE_X + 12, SPHERE_Y + SPHERE_H - 12),
+            (SPHERE_X + SPHERE_W - 12, SPHERE_Y + SPHERE_H - 12),
+        ]
+        for idx, (cx, cy) in enumerate(corners):
+            dx = 1 if idx % 2 == 0 else -1
+            dy = 1 if idx < 2 else -1
+            draw.line([(cx, cy), (cx + dx * bkt, cy)], fill=bkt_c, width=2)
+            draw.line([(cx, cy), (cx, cy + dy * bkt)], fill=bkt_c, width=2)
+
+        # Waveform reference lines
+        mid_y = WAVEFORM_Y + WAVEFORM_HEIGHT // 2
+        wf_l = PADDING + 10
+        wf_r = PADDING + WAVEFORM_W - 10
+        for frac in (-0.5, -0.25, 0.25, 0.5):
+            ry = mid_y + int(frac * WAVEFORM_HEIGHT * 0.8)
+            draw.line([(wf_l, ry), (wf_r, ry)], fill=(220, 220, 220), width=1)
+
+        return img
+
+    def _build_glow_sprite(self, size=512):
+        """Smooth radial bloom (replaces the old banded concentric circles)."""
+        gl = self.cs['glow']
+        yy, xx = np.mgrid[0:size, 0:size]
+        r = np.sqrt((xx - size / 2) ** 2 + (yy - size / 2) ** 2) / (size / 2)
+        alpha = (np.clip(1.0 - r, 0.0, 1.0) ** 2.2) * 60
+        arr = np.zeros((size, size, 4), dtype=np.uint8)
+        arr[..., 0], arr[..., 1], arr[..., 2] = gl[0], gl[1], gl[2]
+        arr[..., 3] = alpha.astype(np.uint8)
+        return Image.fromarray(arr, 'RGBA')
 
     # ── Helpers ──────────────────────────────────────────────
 
@@ -155,23 +237,68 @@ class VisualizerRenderer:
         for y in range(0, HEIGHT, 50):
             draw.line([(0, y), (WIDTH, y)], fill=(232, 232, 232), width=1)
 
-    def draw_background_details(self, draw, t):
-        """Particles, scan-lines and tech-corner brackets inside the sphere area."""
-        pulse = self.smooth_pulse
+    # ── State update (sequential) ────────────────────────────
+
+    def step_state(self, t):
+        """Advance smoothing + particle state for one frame and return a
+        picklable snapshot for draw_frame(). Must be called in frame order."""
+        kick = self.audio.get_kick(t)
+        target_pulse = (kick ** 1.5) * 1.2
+        self.smooth_pulse = self.smooth_pulse * 0.7 + target_pulse * 0.3
+        self.smooth_rot += 0.006 + self.smooth_pulse * 0.04
+        self.smooth_rot_x += 0.003 + self.smooth_pulse * 0.015
+
+        spectrum = self.audio.get_spectrum(t)
+        self.smooth_spectrum = self.smooth_spectrum * 0.6 + spectrum * 0.4
+
+        spec_bands = self.audio.get_spectrum_bands(t, 50)
+        self.smooth_spec_bands = self.smooth_spec_bands * 0.65 + spec_bands * 0.35
+
+        noise_vals = smooth_noise_3d(self.verts, t * 1.5, frequency=3.0, octaves=3)
+        target_deform = np.power(noise_vals, 1.5) * self.smooth_pulse * 0.45
+        self.smooth_deform = self.smooth_deform * 0.75 + target_deform * 0.25
+
+        # Particles
         p = self.particles
+        n = len(p['x'])
+        p['x'] += p['vx'] + np.sin(t * 0.8 + np.arange(n)) * 0.15
+        p['y'] += p['vy'] - self.smooth_pulse * 0.5
+        wrapped = p['y'] < SPHERE_Y + 10
+        p['y'][wrapped] = SPHERE_Y + SPHERE_H - 10
+        bounced = (p['x'] < SPHERE_X + 10) | (p['x'] > SPHERE_X + SPHERE_W - 10)
+        p['vx'][bounced] *= -1
+        particle_alpha = np.minimum(p['alpha'] + self.smooth_pulse * 40, 120)
+
+        lvl_l, lvl_r = self.audio.get_levels(t)
+
+        return {
+            'pulse':          self.smooth_pulse,
+            'rot':            self.smooth_rot,
+            'rot_x':          self.smooth_rot_x,
+            'spectrum':       self.smooth_spectrum.copy(),
+            'spec_bands':     self.smooth_spec_bands.copy(),
+            'deform':         self.smooth_deform.copy(),
+            'particle_x':     p['x'].copy(),
+            'particle_y':     p['y'].copy(),
+            'particle_alpha': particle_alpha,
+            'levels':         (lvl_l, lvl_r),
+        }
+
+    # ── Background details (stateless) ───────────────────────
+
+    def draw_background_details(self, draw, t, state):
+        """Particles, scan-lines and tech-corner brackets inside the sphere area."""
+        px_arr = state['particle_x']
+        py_arr = state['particle_y']
+        pa_arr = state['particle_alpha']
+        sizes = self.particles['size']
+        pc = self.cs['particle']
 
         # ── Floating particles ──
-        for i in range(len(p['x'])):
-            p['x'][i] += p['vx'][i] + math.sin(t * 0.8 + i) * 0.15
-            p['y'][i] += p['vy'][i] - pulse * 0.5
-            if p['y'][i] < SPHERE_Y + 10:
-                p['y'][i] = SPHERE_Y + SPHERE_H - 10
-            if p['x'][i] < SPHERE_X + 10 or p['x'][i] > SPHERE_X + SPHERE_W - 10:
-                p['vx'][i] *= -1
-            a = int(min(p['alpha'][i] + pulse * 40, 120))
-            sz = p['size'][i]
-            px, py = int(p['x'][i]), int(p['y'][i])
-            pc = self.cs['particle']
+        for i in range(len(px_arr)):
+            a = int(pa_arr[i])
+            sz = sizes[i]
+            px, py = int(px_arr[i]), int(py_arr[i])
             draw.ellipse([px - sz, py - sz, px + sz, py + sz],
                          fill=(pc[0], pc[1], pc[2], a))
 
@@ -181,54 +308,40 @@ class VisualizerRenderer:
             draw.line([(SPHERE_X + 10, y), (SPHERE_X + SPHERE_W - 10, y)],
                       fill=(0, 0, 0, 5), width=1)
 
-        # ── Tech corner brackets ──
-        bkt = 30
-        bkt_c = (80, 80, 80, 100)
-        corners = [
-            (SPHERE_X + 12, SPHERE_Y + 12),
-            (SPHERE_X + SPHERE_W - 12, SPHERE_Y + 12),
-            (SPHERE_X + 12, SPHERE_Y + SPHERE_H - 12),
-            (SPHERE_X + SPHERE_W - 12, SPHERE_Y + SPHERE_H - 12),
-        ]
-        for idx, (cx, cy) in enumerate(corners):
-            dx = 1 if idx % 2 == 0 else -1
-            dy = 1 if idx < 2 else -1
-            draw.line([(cx, cy), (cx + dx * bkt, cy)], fill=bkt_c, width=2)
-            draw.line([(cx, cy), (cx, cy + dy * bkt)], fill=bkt_c, width=2)
+    # ── Main draw (pure function of t + state) ───────────────
 
-    # ── Main render ──────────────────────────────────────────
-
-    def render_frame(self, t):
-        # ── Physics ──
-        kick = self.audio.get_kick(t)
-        target_pulse = (kick ** 1.5) * 1.2
-        self.smooth_pulse = self.smooth_pulse * 0.7 + target_pulse * 0.3
-        self.smooth_rot += 0.006 + self.smooth_pulse * 0.04
-        self.smooth_rot_x += 0.003 + self.smooth_pulse * 0.015
-
+    def draw_frame(self, t, state):
+        pulse = state['pulse']
         ac = self.cs['accent']
 
-        # ── Canvas ──
-        img = Image.new('RGB', (WIDTH, HEIGHT), FL_BG_DARK)
+        # ── Canvas (static layer precomputed in __init__) ──
+        img = self._static_bg.copy()
         draw = ImageDraw.Draw(img, 'RGBA')
-        self.draw_grid(draw)
 
         # ════════════════════════════════════════════════════
         #  SPHERE AREA  (center panel — main visual)
         # ════════════════════════════════════════════════════
-        self.draw_rounded_panel(draw, (SPHERE_X, SPHERE_Y, SPHERE_W, SPHERE_H))
         cx = SPHERE_X + SPHERE_W // 2
         cy = SPHERE_Y + SPHERE_H // 2
 
+        # Beat-reactive panel border
+        border_a = int(30 + min(pulse, 1.0) * 140)
+        draw.rounded_rectangle(
+            [SPHERE_X, SPHERE_Y, SPHERE_X + SPHERE_W, SPHERE_Y + SPHERE_H],
+            radius=16, fill=None, outline=(ac[0], ac[1], ac[2], border_a), width=1)
+
+        # Faint guide circle inside the spectrum ring
+        guide_r = SPHERE_RADIUS + 30 + pulse * 10
+        draw.ellipse([cx - guide_r, cy - guide_r, cx + guide_r, cy + guide_r],
+                     outline=(ac[0], ac[1], ac[2], 28), width=1)
+
         # ── Polar spectrum ring ──
-        spectrum = self.audio.get_spectrum(t)
-        self.smooth_spectrum = self.smooth_spectrum * 0.6 + spectrum * 0.4
-        full_spec = np.concatenate((self.smooth_spectrum[::-1], self.smooth_spectrum))
+        full_spec = np.concatenate((state['spectrum'][::-1], state['spectrum']))
         num_ring_pts = len(full_spec)
         base_ring_r = SPHERE_RADIUS + 50
         ring_pts = []
         for i in range(num_ring_pts):
-            angle = (i / num_ring_pts) * 2 * math.pi - (math.pi / 2) + self.smooth_rot * 0.3
+            angle = (i / num_ring_pts) * 2 * math.pi - (math.pi / 2) + state['rot'] * 0.3
             r = base_ring_r + full_spec[i] * 140
             ring_pts.append((cx + math.cos(angle) * r, cy + math.sin(angle) * r))
 
@@ -241,29 +354,21 @@ class VisualizerRenderer:
             draw.line(ring_pts, fill=ac, width=2)
 
         # ── Background details ──
-        self.draw_background_details(draw, t)
+        self.draw_background_details(draw, t, state)
 
-        # ── Ambient glow behind sphere ──
-        gl = self.cs['glow']
-        glow_r = int(SPHERE_RADIUS * (1.2 + self.smooth_pulse * 0.3))
-        for gr in range(glow_r, glow_r - 70, -7):
-            a = int(7 + 5 * (1 - gr / glow_r))
-            draw.ellipse([cx - gr, cy - gr, cx + gr, cy + gr],
-                         fill=(gl[0], gl[1], gl[2], a))
+        # ── Ambient bloom behind sphere (smooth radial sprite) ──
+        glow_d = int(SPHERE_RADIUS * 2 * (1.4 + pulse * 0.45))
+        sprite = self._glow_sprite.resize((glow_d, glow_d))
+        img.paste(sprite, (cx - glow_d // 2, cy - glow_d // 2), sprite)
 
         # ── 3-D Sphere (smooth coherent deformation) ──
-        noise_vals = smooth_noise_3d(self.verts, t * 1.5, frequency=3.0, octaves=3)
-        shaped = np.power(noise_vals, 1.5)
-        target_deform = shaped * self.smooth_pulse * 0.45
-        self.smooth_deform = self.smooth_deform * 0.75 + target_deform * 0.25
-
-        base_scale = 1.0 + self.smooth_pulse * 0.12
-        displacement = self.vert_normals * self.smooth_deform[:, np.newaxis]
+        base_scale = 1.0 + pulse * 0.12
+        displacement = self.vert_normals * state['deform'][:, np.newaxis]
         distorted = self.verts * base_scale + displacement
 
-        cos_y, sin_y = math.cos(self.smooth_rot), math.sin(self.smooth_rot)
+        cos_y, sin_y = math.cos(state['rot']), math.sin(state['rot'])
         ry_mat = np.array([[cos_y, 0, sin_y], [0, 1, 0], [-sin_y, 0, cos_y]])
-        cos_x, sin_x = math.cos(self.smooth_rot_x), math.sin(self.smooth_rot_x)
+        cos_x, sin_x = math.cos(state['rot_x']), math.sin(state['rot_x'])
         rx_mat = np.array([[1, 0, 0], [0, cos_x, -sin_x], [0, sin_x, cos_x]])
         r_verts = np.dot(distorted, np.dot(rx_mat, ry_mat)) * SPHERE_RADIUS
 
@@ -303,23 +408,20 @@ class VisualizerRenderer:
         # ════════════════════════════════════════════════════
         #  SPECTROGRAM  (left panel — vertical mirrored)
         # ════════════════════════════════════════════════════
-        self.draw_rounded_panel(draw, (SPEC_X, SPEC_Y, SPEC_W, SPEC_H))
-
         num_bands = 50
-        spec_bands = self.audio.get_spectrum_bands(t, num_bands)
-        self.smooth_spec_bands = self.smooth_spec_bands * 0.65 + spec_bands * 0.35
+        smooth_spec_bands = state['spec_bands']
 
         sp_l = SPEC_X + 12
         sp_r = SPEC_X + SPEC_W - 12
         sp_max_w = sp_r - sp_l
-        sp_top = SPEC_Y + 15
+        sp_top = SPEC_Y + 32          # clears the SPECTRUM header
         sp_bot = SPEC_Y + SPEC_H - 15
         sp_cx = (sp_l + sp_r) / 2
 
         spec_ys = []
         spec_vals = []
         for i in range(num_bands):
-            val = min(float(self.smooth_spec_bands[i]), 1.0)
+            val = min(float(smooth_spec_bands[i]), 1.0)
             y_pos = sp_bot - ((i + 0.5) / num_bands) * (sp_bot - sp_top)
             spec_ys.append(y_pos)
             spec_vals.append(val)
@@ -355,8 +457,6 @@ class VisualizerRenderer:
         # ════════════════════════════════════════════════════
         #  WAVEFORM  (bottom strip — horizontal mirrored)
         # ════════════════════════════════════════════════════
-        self.draw_rounded_panel(draw, (PADDING, WAVEFORM_Y, WAVEFORM_W, WAVEFORM_HEIGHT))
-
         center_idx = int(t * self.audio.sr)
         window_samples = int(self.audio.sr * 4)  # 4 seconds
         start = center_idx - window_samples // 2
@@ -378,11 +478,6 @@ class VisualizerRenderer:
         wf_l = PADDING + 10
         wf_r = PADDING + WAVEFORM_W - 10
         amp_sc = WAVEFORM_HEIGHT * 0.40
-
-        # Subtle reference lines
-        for frac in (-0.5, -0.25, 0.25, 0.5):
-            ry = mid_y + int(frac * WAVEFORM_HEIGHT * 0.8)
-            draw.line([(wf_l, ry), (wf_r, ry)], fill=(220, 220, 220), width=1)
 
         wl = self.cs['wave_lo']
         wh = self.cs['wave_hi']
@@ -416,11 +511,24 @@ class VisualizerRenderer:
         draw.line([ph_x, WAVEFORM_Y + 8, ph_x, WAVEFORM_Y + WAVEFORM_HEIGHT - 8],
                   fill=ac, width=2)
 
+        # Time readout + track progress
+        if self.total_dur:
+            time_txt = (f"{int(t // 60):02d}:{int(t % 60):02d} / "
+                        f"{int(self.total_dur // 60):02d}:{int(self.total_dur % 60):02d}")
+            tb = draw.textbbox((0, 0), time_txt, font=self.font_time)
+            draw.text((wf_r - (tb[2] - tb[0]) - 6, WAVEFORM_Y + 7), time_txt,
+                      font=self.font_time, fill=FL_TEXT_DIM)
+
+            prog_y = WAVEFORM_Y + WAVEFORM_HEIGHT - 6
+            frac = min(t / self.total_dur, 1.0)
+            draw.line([(wf_l, prog_y), (wf_r, prog_y)], fill=(225, 225, 225), width=3)
+            draw.line([(wf_l, prog_y), (wf_l + frac * (wf_r - wf_l), prog_y)],
+                      fill=ac, width=3)
+
         # ════════════════════════════════════════════════════
         #  VU METERS  (bottom-right — segmented gradient bars)
         # ════════════════════════════════════════════════════
-        self.draw_rounded_panel(draw, (VU_X, VU_Y, VU_W, VU_H))
-        lvl_l, lvl_r = self.audio.get_levels(t)
+        lvl_l, lvl_r = state['levels']
 
         bar_top = VU_Y + 25
         bar_bot = VU_Y + VU_H - 10
@@ -457,9 +565,6 @@ class VisualizerRenderer:
             peak_y = bar_bot - int(lvl * bar_h)
             draw.rectangle([bx1, peak_y - 1, bx2, peak_y + 1], fill=(40, 40, 40))
 
-            # Label above bar
-            draw.text((bx1 + 8, VU_Y + 8), label, fill=FL_TEXT_DIM, font=self.font_header)
-
         # ════════════════════════════════════════════════════
         #  METADATA OVERLAY  (top-right, frosted glass)
         # ════════════════════════════════════════════════════
@@ -484,17 +589,25 @@ class VisualizerRenderer:
         draw.text((meta_x + 14, meta_y + 50), f"Prod. {self.meta['producer']}",
                   font=self.font_sub, fill=FL_TEXT_DIM)
 
-        # BPM + Key (right-aligned inside panel)
-        bpm_text = self.meta['bpm']
-        key_text = self.meta.get('key', '')
-        bpm_bbox = draw.textbbox((0, 0), bpm_text, font=self.font_tech)
-        bpm_w = bpm_bbox[2] - bpm_bbox[0]
-        draw.text((meta_x + panel_w - bpm_w - 14, meta_y + 16), bpm_text,
-                  font=self.font_tech, fill=self.cs['secondary'])
-        if key_text:
-            key_bbox = draw.textbbox((0, 0), key_text, font=self.font_tech)
-            key_w = key_bbox[2] - key_bbox[0]
-            draw.text((meta_x + panel_w - key_w - 14, meta_y + 46), key_text,
-                      font=self.font_tech, fill=self.cs['secondary'])
+        # BPM + Key chips (right-aligned pills inside panel)
+        chips = [c for c in (self.meta['bpm'], self.meta.get('key', '')) if c]
+        chip_y = meta_y + 16
+        for chip in chips:
+            cb = draw.textbbox((0, 0), chip, font=self.font_tech)
+            cw, ch = cb[2] - cb[0], cb[3] - cb[1]
+            x1 = meta_x + panel_w - cw - 34
+            draw.rounded_rectangle(
+                [x1, chip_y - 5, meta_x + panel_w - 14, chip_y + ch + 7],
+                radius=(ch + 12) // 2,
+                fill=(ac[0], ac[1], ac[2], 26),
+                outline=(ac[0], ac[1], ac[2], 70), width=1)
+            draw.text((x1 + 10, chip_y), chip,
+                      font=self.font_tech, fill=self.cs['accent_dim'])
+            chip_y += ch + 16
 
         return np.array(img)
+
+    # ── Sequential convenience API ───────────────────────────
+
+    def render_frame(self, t):
+        return self.draw_frame(t, self.step_state(t))

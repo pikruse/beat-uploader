@@ -2,6 +2,7 @@
 """Static SEO description template and title formatter for YouTube beat uploads."""
 
 import os
+import re
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -103,10 +104,53 @@ def generate_description(
     return "\n".join(lines)
 
 
-def format_youtube_title(title: str, producer: str, bpm: str) -> str:
+def clean_producer(producer: str) -> str:
+    """Strip a leading "prod"/"prod." credit from each producer name.
+
+    Beat filenames often already carry the credit ("NightDrive 140 prod pk"),
+    and the title/description templates add their own "prod" — without this
+    the output reads "prod prod pk". Names merely starting with the letters
+    (e.g. "Prodigy") are untouched: only a standalone leading word counts.
+    """
+    parts = [re.sub(r"^prod\.?\s+", "", p.strip(), flags=re.IGNORECASE).strip()
+             for p in producer.split(",")]
+    parts = [p for p in parts if p]
+    return ", ".join(parts) if parts else producer.strip()
+
+
+def format_youtube_title(title: str, producer: str, bpm: str,
+                         tags: list[str] | None = None) -> str:
     """Format a standard type-beat YouTube title.
 
-    Example:  TimeTraveller, prod pk    
+    Example:  [Free] trap x dark type beat - "TimeTraveller" 148 bpm, prod pk
+
+    YouTube rejects titles over 100 characters or containing < / > with
+    "invalidTitle", so this strips those characters and, if the full form is
+    too long, drops the tags, then the producer credit, before hard-trimming.
     """
-    bpm_num = bpm.lower().replace("bpm", "").strip()
-    return f"{title}, prod {producer}"
+    def clean(s: str) -> str:
+        return s.replace("<", "").replace(">", "").strip()
+
+    title = clean(title)
+    bpm_num = clean(bpm.lower().replace("bpm", "").strip())
+
+    tag_part = " x ".join(clean(t) for t in (tags or []) if clean(t))
+    tag_part = f"{tag_part} " if tag_part else ""
+
+    producers = [clean(p) for p in clean_producer(producer).split(",") if clean(p)]
+    if not producers:
+        prod_part = ""
+    elif len(producers) == 1:
+        prod_part = producers[0]
+    else:
+        prod_part = ", ".join(producers[:-1]) + " and " + producers[-1]
+
+    candidates = [
+        f'[Free] {tag_part}type beat - "{title}" {bpm_num} bpm, prod {prod_part}',
+        f'[Free] type beat - "{title}" {bpm_num} bpm, prod {prod_part}',
+        f'[Free] type beat - "{title}" {bpm_num} bpm',
+    ]
+    for cand in candidates:
+        if len(cand) <= 100:
+            return cand
+    return candidates[-1][:100]

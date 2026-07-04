@@ -1,4 +1,5 @@
 # src/config.py
+import os
 import random
 
 # ──────────────────────────────────────────────────────────────
@@ -10,7 +11,9 @@ FL_BORDER = (200, 200, 200)
 FL_TEXT_MAIN = (30, 30, 30)
 FL_TEXT_DIM = (100, 100, 100)
 
-FONT_DIR = "fonts/oxanium"
+# Absolute so rendering works regardless of the process's working directory
+FONT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "fonts", "oxanium")
 
 # ──────────────────────────────────────────────────────────────
 # COLOR SCHEMES

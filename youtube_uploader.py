@@ -55,6 +55,7 @@ def upload_video(
     tags: list[str] | None = None,
     category_id: str = "10",      # Music
     privacy: str = "unlisted",
+    log=print,
 ) -> str:
     """Upload a video to YouTube and return its URL.
 
@@ -87,7 +88,10 @@ def upload_video(
         },
     }
 
-    media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True)
+    # 32 MB chunks: fewer request round-trips than the default while still
+    # giving progress updates and resumability.
+    media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True,
+                            chunksize=32 * 1024 * 1024)
 
     request = youtube.videos().insert(
         part="snippet,status",
@@ -95,15 +99,15 @@ def upload_video(
         media_body=media,
     )
 
-    print("  Uploading to YouTube...")
+    log("  Uploading to YouTube...")
     response = None
     while response is None:
         status, response = request.next_chunk()
         if status:
             pct = int(status.progress() * 100)
-            print(f"  Upload progress: {pct}%")
+            log(f"  Upload progress: {pct}%")
 
     video_id = response["id"]
     url = f"https://youtu.be/{video_id}"
-    print(f"  Upload complete: {url}")
+    log(f"  Upload complete: {url}")
     return url

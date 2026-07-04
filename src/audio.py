@@ -8,11 +8,12 @@ class AudioAnalyzer:
         self.fps = fps
         print(f"Analyzing audio: {audio_path}")
 
-        # Mono for analysis, stereo for VU meters
-        self.y, self.sr = librosa.load(audio_path, sr=22050, mono=True)
-        self.y_stereo, _ = librosa.load(audio_path, sr=22050, mono=False)
-        if self.y_stereo.ndim == 1:
-            self.y_stereo = np.vstack((self.y_stereo, self.y_stereo))
+        # Decode once: stereo for VU meters, mono mixdown for analysis
+        y_st, self.sr = librosa.load(audio_path, sr=22050, mono=False)
+        if y_st.ndim == 1:
+            y_st = np.vstack((y_st, y_st))
+        self.y_stereo = y_st
+        self.y = librosa.to_mono(y_st)
 
         self.duration = librosa.get_duration(y=self.y, sr=self.sr)
         if duration_limit:
