@@ -5,6 +5,40 @@ from PIL import Image, ImageDraw, ImageFont
 from src.config import *
 
 
+# ── FAST LAYER FILL ──────────────────────────────────────────
+
+def _span_max(centers, xp, fp, lo):
+    """Max of the piecewise-linear profile (xp, fp) over each 1-px cell
+    [c - 0.5, c + 0.5] — like PIL's polygon fill, any pixel the shape touches
+    is covered, so narrow dips/spikes don't open gaps or vanish."""
+    out = np.maximum(np.interp(centers - 0.5, xp, fp), np.interp(centers + 0.5, xp, fp))
+    idx = np.clip(np.rint(xp).astype(int) - lo, 0, len(centers) - 1)
+    np.maximum.at(out, idx, fp)
+    return out
+
+
+def _blend_nested(img, x0, y0, x1, y1, depth, layers):
+    """Alpha-blend nested fill layers into img[y0:y1, x0:x1].
+
+    Replaces stacks of large semi-transparent PIL polygons (the waveform and
+    spectrum fills), which were ~half of all drawing time. The layers are
+    nested — layer i+1 lies inside layer i — so a pixel's result depends only
+    on how many layers cover it: depth[h, w] (0..len(layers)). Each depth's
+    blend collapses to out = bg * keep[depth] + add[depth], one pass total.
+    layers: [(r, g, b), alpha 0-255] from outermost to innermost.
+    """
+    n = len(layers)
+    keep = np.ones(n + 1, np.float32)
+    add = np.zeros((n + 1, 3), np.float32)
+    for i, (col, alpha) in enumerate(layers):
+        a = alpha / 255.0
+        keep[i + 1] = keep[i] * (1.0 - a)
+        add[i + 1] = add[i] * (1.0 - a) + np.asarray(col, np.float32) * a
+    region = np.asarray(img.crop((x0, y0, x1, y1)), dtype=np.float32)
+    out = region * keep[depth][..., None] + add[depth]
+    img.paste(Image.fromarray(np.rint(out).astype(np.uint8)), (x0, y0))
+
+
 # ── GEOMETRY ─────────────────────────────────────────────────
 
 def normalize(v):
@@ -358,7 +392,7 @@ class VisualizerRenderer:
 
         # ── Ambient bloom behind sphere (smooth radial sprite) ──
         glow_d = int(SPHERE_RADIUS * 2 * (1.4 + pulse * 0.45))
-        sprite = self._glow_sprite.resize((glow_d, glow_d))
+        sprite = self._glow_sprite.resize((glow_d, glow_d), Image.BILINEAR)
         img.paste(sprite, (cx - glow_d // 2, cy - glow_d // 2), sprite)
 
         # ── 3-D Sphere (smooth coherent deformation) ──
@@ -418,13 +452,8 @@ class VisualizerRenderer:
         sp_bot = SPEC_Y + SPEC_H - 15
         sp_cx = (sp_l + sp_r) / 2
 
-        spec_ys = []
-        spec_vals = []
-        for i in range(num_bands):
-            val = min(float(smooth_spec_bands[i]), 1.0)
-            y_pos = sp_bot - ((i + 0.5) / num_bands) * (sp_bot - sp_top)
-            spec_ys.append(y_pos)
-            spec_vals.append(val)
+        spec_vals = np.minimum(np.asarray(smooth_spec_bands[:num_bands], dtype=float), 1.0)
+        spec_ys = sp_bot - ((np.arange(num_bands) + 0.5) / num_bands) * (sp_bot - sp_top)
 
         layer_defs = [
             (1.0,  0.15, 25),
@@ -434,22 +463,21 @@ class VisualizerRenderer:
             (0.15, 1.00, 230),
         ]
         ad = self.cs['accent_dim']
-        for amp_frac, color_t, alpha in layer_defs:
-            col = self.lerp_color(ad, ac, color_t)
-            r_pts = [(sp_cx, spec_ys[0])]
-            l_pts = [(sp_cx, spec_ys[0])]
-            for k in range(num_bands):
-                hw = spec_vals[k] * (sp_max_w / 2) * amp_frac
-                r_pts.append((sp_cx + hw, spec_ys[k]))
-                l_pts.append((sp_cx - hw, spec_ys[k]))
-            r_pts.append((sp_cx, spec_ys[-1]))
-            l_pts.append((sp_cx, spec_ys[-1]))
-            draw.polygon(r_pts, fill=(col[0], col[1], col[2], alpha))
-            draw.polygon(l_pts, fill=(col[0], col[1], col[2], alpha))
+        # Mirrored fill: at row y the shape spans |x - centre| <= half-width(y)
+        bx0, bx1 = int(math.floor(sp_l)) - 1, int(math.ceil(sp_r)) + 2
+        by0, by1 = int(math.floor(spec_ys[-1])), int(math.ceil(spec_ys[0])) + 1
+        yy = np.arange(by0, by1)
+        hw_rows = _span_max(yy, spec_ys[::-1], spec_vals[::-1], by0) * (sp_max_w / 2)
+        in_y = ((yy >= spec_ys[-1]) & (yy <= spec_ys[0]))[:, None]
+        dx = np.abs(np.arange(bx0, bx1) - sp_cx)[None, :]
+        depth = sum(((dx <= hw_rows[:, None] * f) & in_y).astype(np.uint8)
+                    for f, _, _ in layer_defs)
+        _blend_nested(img, bx0, by0, bx1, by1, depth,
+                      [(self.lerp_color(ad, ac, ct), al) for _, ct, al in layer_defs])
 
         # Edge contours
-        r_edge = [(sp_cx + spec_vals[k] * sp_max_w / 2, spec_ys[k]) for k in range(num_bands)]
-        l_edge = [(sp_cx - spec_vals[k] * sp_max_w / 2, spec_ys[k]) for k in range(num_bands)]
+        r_edge = list(zip((sp_cx + spec_vals * sp_max_w / 2).tolist(), spec_ys.tolist()))
+        l_edge = list(zip((sp_cx - spec_vals * sp_max_w / 2).tolist(), spec_ys.tolist()))
         draw.line(r_edge, fill=(ac[0], ac[1], ac[2], 100), width=1)
         draw.line(l_edge, fill=(ac[0], ac[1], ac[2], 100), width=1)
         draw.line([(sp_cx, sp_top), (sp_cx, sp_bot)], fill=(200, 200, 200), width=1)
@@ -483,23 +511,24 @@ class VisualizerRenderer:
         wh = self.cs['wave_hi']
         n_pts = 800
         w_idx = np.linspace(0, res - 1, n_pts).astype(int)
-        x_arr = [wf_l + (i / (n_pts - 1)) * (wf_r - wf_l) for i in range(n_pts)]
-        a_arr = [abs(view_wave[w_idx[i]]) for i in range(n_pts)]
+        x_pts = wf_l + (np.arange(n_pts) / (n_pts - 1)) * (wf_r - wf_l)
+        a_pts = np.abs(view_wave[w_idx]).astype(float)
 
-        for amp_frac, color_t, alpha in layer_defs:
-            col = self.lerp_color(wl, wh, color_t)
-            u_poly = ([(x_arr[0], mid_y)]
-                      + [(x_arr[k], mid_y - a_arr[k] * amp_sc * amp_frac) for k in range(n_pts)]
-                      + [(x_arr[-1], mid_y)])
-            l_poly = ([(x_arr[0], mid_y)]
-                      + [(x_arr[k], mid_y + a_arr[k] * amp_sc * amp_frac) for k in range(n_pts)]
-                      + [(x_arr[-1], mid_y)])
-            draw.polygon(u_poly, fill=(col[0], col[1], col[2], alpha))
-            draw.polygon(l_poly, fill=(col[0], col[1], col[2], alpha))
+        # Mirrored fill: at column x the shape spans |y - mid| <= height(x)
+        bx0, bx1 = int(math.floor(wf_l)), int(math.ceil(wf_r)) + 1
+        by0, by1 = int(math.floor(mid_y - amp_sc)) - 1, int(math.ceil(mid_y + amp_sc)) + 2
+        xx = np.arange(bx0, bx1)
+        h_cols = _span_max(xx, x_pts, a_pts, bx0) * amp_sc
+        in_x = ((xx >= wf_l) & (xx <= wf_r))[None, :]
+        dy = np.abs(np.arange(by0, by1) - mid_y)[:, None]
+        depth = sum(((dy <= h_cols[None, :] * f) & in_x).astype(np.uint8)
+                    for f, _, _ in layer_defs)
+        _blend_nested(img, bx0, by0, bx1, by1, depth,
+                      [(self.lerp_color(wl, wh, ct), al) for _, ct, al in layer_defs])
 
         # Edge contours
-        u_edge = [(x_arr[k], mid_y - a_arr[k] * amp_sc) for k in range(n_pts)]
-        l_edge = [(x_arr[k], mid_y + a_arr[k] * amp_sc) for k in range(n_pts)]
+        u_edge = list(zip(x_pts.tolist(), (mid_y - a_pts * amp_sc).tolist()))
+        l_edge = list(zip(x_pts.tolist(), (mid_y + a_pts * amp_sc).tolist()))
         draw.line(u_edge, fill=(ac[0], ac[1], ac[2], 100), width=1)
         draw.line(l_edge, fill=(ac[0], ac[1], ac[2], 100), width=1)
         draw.line([(wf_l, mid_y), (wf_r, mid_y)], fill=(200, 200, 200), width=1)

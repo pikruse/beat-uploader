@@ -1,8 +1,10 @@
 numpy
 Pillow
 librosa
+decorator   # librosa needs it; went missing once and broke analysis
 imageio-ffmpeg
 click
 google-api-python-client
 google-auth-oauthlib
 python-dotenv
+playwright      # BeatStars upload (uses your installed Google Chrome)

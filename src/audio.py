@@ -6,7 +6,6 @@ import numpy as np
 class AudioAnalyzer:
     def __init__(self, audio_path, fps, duration_limit=None):
         self.fps = fps
-        print(f"Analyzing audio: {audio_path}")
 
         # Decode once: stereo for VU meters, mono mixdown for analysis
         y_st, self.sr = librosa.load(audio_path, sr=22050, mono=False)

@@ -29,15 +29,42 @@ location. If the app ever fails silently, check
 launches through Terminal and always has file access.
 
 Either way a local page opens (http://127.0.0.1:8765) where you drag & drop
-beats, type a title per beat, set shared options (tags, BeatStars URL,
-privacy, color scheme), and hit Start. Beats are queued and processed one at
-a time with live per-beat progress and a log. The "quit app" link in the
-footer stops the server.
+beats and fill in each one's title / BPM / producer, **BeatStars link** and
+optional **publish time**. Shared options: tags, privacy, color scheme, a
+default BeatStars link (for beats left blank), and "delete render after
+upload" (on by default — the mp4 is removed once YouTube has it).
 
-Files named `<name> <bpm> <producer>` (e.g. `NightDrive 140 pk.mp3`,
-underscores/hyphens also fine) are parsed automatically: the name prefills
-the title and the bpm/producer are used for that beat. Files without a bpm
-token fall back to auto-detected BPM and the Producer field.
+- **BeatStars upload:** with "Upload to BeatStars" on (default), each beat
+  without a link is published to BeatStars after it renders — mp3 master,
+  title, detected BPM + key, same visibility as YouTube; BeatStars' autofill
+  and your account defaults handle genre/moods/tags/license prices. The new
+  link goes into the YouTube description. A Chrome window shows for ~1 min
+  per beat while it does this (BeatStars blocks hidden/headless browsers).
+  First time, or when it says the login expired: click **Connect BeatStars**
+  (or `python beatstars_uploader.py --login`). BeatStars needs 320 kbps mp3s;
+  lower-bitrate files are converted automatically.
+- **Batch links:** copy several BeatStars links (one per line) and paste them
+  into the first row's link box — they fill down the rows in order.
+- **Scheduling:** set "first beat at" + "every N days" and hit *Apply to
+  beats*, or set times per row. Scheduled beats upload as private and YouTube
+  publishes them at that time.
+- **Set and forget:** after Start you can close the tab. Beats keep
+  processing (the Mac is kept awake, a notification fires per beat) and the
+  app quits itself once the queue is empty. Reopen the page any time to see
+  progress — the queue is shown again.
+- **Retry:** a failed beat gets a ↻ button; if its render had finished, only
+  the upload is redone.
+- **Quitting:** "quit now" on the page or Quit from the Dock both stop the
+  server cleanly (and ask first if beats are still processing).
+
+Files named `<name> <bpm> <producer>` (e.g. `NightDrive 140 prod pk.mp3`,
+underscores/hyphens fine, a "prod" prefix is stripped) are parsed
+automatically into the per-beat fields, with a live preview of the final
+YouTube title under each row. Missing bpm falls back to auto-detection;
+missing producer defaults to "pk".
+
+The .app is built from `launcher.applescript` (rebuild steps are at the top
+of that file).
 
 ## CLI
 
@@ -47,7 +74,8 @@ python main.py --audio beat.mp3 --title "TimeTraveller" --tags "trap,dark" \
 ```
 
 Useful flags: `--skip-youtube` (render only), `--scheme cyber`, `--duration 30`
-(preview), `--privacy unlisted`, `--workers N`. BPM and key are auto-detected
+(preview), `--privacy unlisted`, `--workers N`, `--publish-at "2026-11-20 15:00"`
+(schedule, local time), `--delete-render`. BPM and key are auto-detected
 unless overridden with `--bpm` / `--key`.
 
 `media_processor.py` is a render-only alias (same as `--skip-youtube`).
@@ -56,9 +84,16 @@ unless overridden with `--bpm` / `--key`.
 
 - A sequential "physics" pass computes per-frame smoothing/particle state
   (cheap, keeps visuals identical to single-threaded rendering).
-- Frames are then drawn in parallel across all CPU cores
-  (`src/render.py`) and piped straight into ffmpeg — no intermediate
-  files, audio muxed in the same pass.
+- Frames are drawn in parallel across all CPU cores (`src/render.py`) into a
+  shared-memory ring buffer and streamed straight into ffmpeg — no pickling
+  6 MB frames between processes, no intermediate files, audio muxed in the
+  same pass. The waveform/spectrum fills are numpy, not PIL polygons.
+- On Macs the video is encoded by the hardware encoder (VideoToolbox, 12
+  Mbps — same measured quality as the old x264 crf 23, ~40% larger file),
+  which leaves the CPU to drawing. A 2:40 beat renders in ~55 s (was ~160 s).
+  `BEAT_ENCODER=x264` switches back to the smaller-file CPU encoder (~110 s)
+  if your upload connection is slow; `BEAT_VT_BITRATE=10M` trades a little
+  quality for size.
 
 ## Layout
 
@@ -67,4 +102,5 @@ unless overridden with `--bpm` / `--key`.
 - `src/visualizer.py` — frame drawing (PIL)
 - `src/render.py` — parallel rendering + ffmpeg encode
 - `youtube_uploader.py` — YouTube Data API v3 upload
+- `beatstars_uploader.py` — BeatStars Studio automation (Playwright + Chrome)
 - `utils.py` — title/description (SEO) templates

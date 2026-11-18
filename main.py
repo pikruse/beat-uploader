@@ -24,13 +24,26 @@ import click
 @click.option("--privacy", default="public",
               type=click.Choice(["public", "unlisted", "private"]),
               help="YouTube privacy status")
+@click.option("--publish-at", default=None,
+              help='Schedule publishing, local time "YYYY-MM-DD HH:MM" (uploads as private until then)')
+@click.option("--delete-render", is_flag=True, help="Delete the local mp4 after a successful upload")
 @click.option("--skip-youtube", is_flag=True, help="Only render video, skip YouTube upload")
 def main(audio, title, producer, bpm, key, tags, beatstars_url,
-         scheme, duration, output, workers, privacy, skip_youtube):
+         scheme, duration, output, workers, privacy, publish_at, delete_render, skip_youtube):
     """Render a beat visualizer and upload it to YouTube."""
     # Imported here (not at module top) so multiprocessing workers spawned
     # during rendering don't re-import librosa / googleapiclient.
+    from datetime import datetime, timezone
     from src.pipeline import run_pipeline
+
+    if publish_at:
+        try:
+            when = datetime.fromisoformat(publish_at).astimezone(timezone.utc)
+        except ValueError:
+            raise click.BadParameter('use "YYYY-MM-DD HH:MM"', param_hint="--publish-at")
+        if when <= datetime.now(timezone.utc):
+            raise click.BadParameter("must be in the future", param_hint="--publish-at")
+        publish_at = when.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     print("══════════════════════════════════════")
     print("  BEAT UPLOAD PIPELINE")
@@ -48,7 +61,9 @@ def main(audio, title, producer, bpm, key, tags, beatstars_url,
         duration=duration,
         output=output,
         privacy=privacy,
+        publish_at=publish_at,
         skip_youtube=skip_youtube,
+        delete_after_upload=delete_render,
         workers=workers,
     )
 

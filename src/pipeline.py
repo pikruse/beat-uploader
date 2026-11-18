@@ -1,7 +1,9 @@
 # src/pipeline.py
 """Shared beat-upload pipeline: analyze → render → upload.
 
-Used by both the CLI (main.py) and the GUI (gui.py).
+Used by both the CLI (main.py) and the GUI (gui.py). The GUI calls
+render_beat / upload_beat separately so a failed upload can be retried
+without re-rendering.
 """
 
 import os
@@ -14,38 +16,43 @@ from utils import generate_description, format_youtube_title, clean_producer
 from youtube_uploader import upload_video
 
 
-def run_pipeline(
+def _unique_path(path):
+    """output/X.mp4 → output/X_2.mp4 if X.mp4 already exists."""
+    if not os.path.exists(path):
+        return path
+    stem, ext = os.path.splitext(path)
+    n = 2
+    while os.path.exists(f"{stem}_{n}{ext}"):
+        n += 1
+    return f"{stem}_{n}{ext}"
+
+
+def render_beat(
     audio,
     title,
     producer="pk",
     bpm=None,
     key=None,
-    tags=None,
-    beatstars_url=None,
     scheme=None,
     duration=None,
     output=None,
-    privacy="public",
-    skip_youtube=False,
     workers=None,
     log=print,
     progress=None,
+    should_stop=None,
 ):
-    """Render a visualizer for *audio* and (optionally) upload it to YouTube.
+    """Analyze *audio* and render its visualizer video.
 
-    tags:     list of genre/mood strings.
-    log:      called with status lines (GUI redirects these).
-    progress: optional callable(frac) for render progress.
-
-    Returns dict: {'output', 'url' (None if skipped), 'bpm', 'key', 'scheme'}.
+    Returns dict: {'output', 'producer', 'bpm', 'key', 'scheme'} — everything
+    upload_beat needs, so an upload can be retried from it later.
     """
-    tag_list = list(tags) if tags else []
     # "prod pk" → "pk": the overlay/title/description templates add their own credit
     producer = clean_producer(producer)
 
     if output is None:
         os.makedirs("output", exist_ok=True)
-        output = f"output/{title.replace(' ', '_')}.mp4"
+        # Never overwrite another beat's render that shares the title
+        output = _unique_path(f"output/{title.replace(' ', '_')}.mp4")
     else:
         out_dir = os.path.dirname(output)
         if out_dir:
@@ -57,7 +64,7 @@ def run_pipeline(
         bpm = f"{str(bpm).strip()} BPM"
 
     # ── Audio analysis ──
-    log(f"Analyzing audio: {audio}")
+    log(f"Analyzing audio: {os.path.basename(audio)}")
     analyzer = AudioAnalyzer(audio, FPS, duration)
     bpm_text = bpm if bpm else f"{int(round(analyzer.bpm))} BPM"
     key_text = key if key else analyzer.key_label
@@ -73,31 +80,91 @@ def run_pipeline(
     verts, edges = create_icosphere(radius=1.0, subdivisions=2)
     meta = {"title": title, "producer": producer, "bpm": bpm_text, "key": key_text}
     render_video(analyzer, meta, verts, edges, cs, audio, output, FPS,
-                 workers=workers, log=log, progress=progress)
+                 workers=workers, log=log, progress=progress, should_stop=should_stop)
     log(f"  Video saved: {output}")
 
-    result = {"output": output, "url": None,
-              "bpm": bpm_text, "key": key_text, "scheme": cs_key}
+    return {"output": output, "producer": producer,
+            "bpm": bpm_text, "key": key_text, "scheme": cs_key}
 
-    if skip_youtube:
-        log("Skipping YouTube upload")
-        return result
 
-    # ── Upload ──
-    yt_title = format_youtube_title(title, producer, bpm_text, tags=tag_list)
+def upload_beat(
+    render,
+    title,
+    tags=None,
+    beatstars_url=None,
+    privacy="public",
+    publish_at=None,
+    delete_after_upload=False,
+    log=print,
+    progress=None,
+    should_stop=None,
+):
+    """Upload a render_beat() result to YouTube. Returns the video URL.
+
+    publish_at:          RFC 3339 UTC string — schedule instead of publishing now.
+    delete_after_upload: remove the local mp4 once YouTube has it.
+    """
+    tag_list = list(tags) if tags else []
+    producer = render["producer"]
+    yt_title = format_youtube_title(title, producer, render["bpm"], tags=tag_list)
     yt_description = generate_description(
-        title=title, producer=producer, bpm=bpm_text, key=key_text,
+        title=title, producer=producer, bpm=render["bpm"], key=render["key"],
         beatstars_url=beatstars_url or "", tags=tag_list,
     )
     log(f"Uploading to YouTube: {yt_title}")
     url = upload_video(
-        file_path=output,
+        file_path=render["output"],
         title=yt_title,
         description=yt_description,
         tags=tag_list + ["type beat", "instrumental", "free beat", producer],
         privacy=privacy,
+        publish_at=publish_at,
         log=log,
+        progress=progress,
+        should_stop=should_stop,
     )
-    result["url"] = url
+    if delete_after_upload:
+        try:
+            os.remove(render["output"])
+            log(f"  Deleted local render: {render['output']}")
+        except OSError as e:
+            log(f"  Could not delete {render['output']}: {e}")
     log(f"Done! {url}")
+    return url
+
+
+def run_pipeline(
+    audio,
+    title,
+    producer="pk",
+    bpm=None,
+    key=None,
+    tags=None,
+    beatstars_url=None,
+    scheme=None,
+    duration=None,
+    output=None,
+    privacy="public",
+    publish_at=None,
+    skip_youtube=False,
+    delete_after_upload=False,
+    workers=None,
+    log=print,
+    progress=None,
+):
+    """Render a visualizer for *audio* and (optionally) upload it to YouTube.
+
+    Returns dict: {'output', 'url' (None if skipped), 'bpm', 'key', 'scheme'}.
+    """
+    render = render_beat(audio, title, producer=producer, bpm=bpm, key=key,
+                         scheme=scheme, duration=duration, output=output,
+                         workers=workers, log=log, progress=progress)
+    result = {"output": render["output"], "url": None, "bpm": render["bpm"],
+              "key": render["key"], "scheme": render["scheme"]}
+    if skip_youtube:
+        log("Skipping YouTube upload")
+        return result
+    result["url"] = upload_beat(render, title, tags=tags, beatstars_url=beatstars_url,
+                                privacy=privacy, publish_at=publish_at,
+                                delete_after_upload=delete_after_upload, log=log)
     return result

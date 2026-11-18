@@ -11,9 +11,15 @@ First-run setup:
 """
 
 import os
+import random
+import socket
+import time
+
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaFileUpload
 from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 
@@ -21,8 +27,16 @@ CLIENT_SECRET = "auth/client_secret.json"
 TOKEN_CACHE = "auth/token.json"
 SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
 
+# Transient failures worth retrying a chunk for (Google's recommended set)
+RETRY_STATUS = {500, 502, 503, 504}
+MAX_RETRIES = 6
 
-def _get_authenticated_service():
+
+class UploadCancelled(Exception):
+    pass
+
+
+def _get_authenticated_service(log=print):
     """Return an authorized YouTube API service object."""
     creds = None
 
@@ -31,8 +45,14 @@ def _get_authenticated_service():
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
+            try:
+                creds.refresh(Request())
+            except RefreshError:
+                # Revoked, or expired — apps left in Google's "Testing" mode
+                # get refresh tokens that die after 7 days. Re-consent.
+                log("  YouTube login expired — opening browser to sign in again")
+                creds = None
+        if not creds or not creds.valid:
             if not os.path.exists(CLIENT_SECRET):
                 raise FileNotFoundError(
                     f"Missing {CLIENT_SECRET}. Download OAuth client JSON from "
@@ -55,7 +75,10 @@ def upload_video(
     tags: list[str] | None = None,
     category_id: str = "10",      # Music
     privacy: str = "unlisted",
+    publish_at: str | None = None,
     log=print,
+    progress=None,
+    should_stop=None,
 ) -> str:
     """Upload a video to YouTube and return its URL.
 
@@ -66,6 +89,11 @@ def upload_video(
         tags:         List of keyword tags.
         category_id:  YouTube category (10 = Music).
         privacy:      unlisted | public | private.
+        publish_at:   RFC 3339 UTC time ("2026-11-20T20:00:00Z"). When set,
+                      the video uploads as private and YouTube publishes it
+                      at that time (privacy is ignored).
+        progress:     optional callable(frac in [0, 1]).
+        should_stop:  optional callable; returning True aborts between chunks.
 
     Returns:
         Full YouTube video URL (https://youtu.be/<id>).
@@ -73,7 +101,12 @@ def upload_video(
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"Video not found: {file_path}")
 
-    youtube = _get_authenticated_service()
+    youtube = _get_authenticated_service(log=log)
+
+    status = {"privacyStatus": privacy, "selfDeclaredMadeForKids": False}
+    if publish_at:
+        status["privacyStatus"] = "private"   # required by the API for publishAt
+        status["publishAt"] = publish_at
 
     body = {
         "snippet": {
@@ -82,10 +115,7 @@ def upload_video(
             "tags": tags or [],
             "categoryId": category_id,
         },
-        "status": {
-            "privacyStatus": privacy,
-            "selfDeclaredMadeForKids": False,
-        },
+        "status": status,
     }
 
     # 32 MB chunks: fewer request round-trips than the default while still
@@ -101,13 +131,32 @@ def upload_video(
 
     log("  Uploading to YouTube...")
     response = None
+    retries = 0
     while response is None:
-        status, response = request.next_chunk()
-        if status:
-            pct = int(status.progress() * 100)
-            log(f"  Upload progress: {pct}%")
+        if should_stop and should_stop():
+            raise UploadCancelled("upload cancelled")
+        try:
+            chunk_status, response = request.next_chunk()
+            retries = 0
+        except (HttpError, ConnectionError, socket.timeout, TimeoutError) as e:
+            transient = (not isinstance(e, HttpError)
+                         or e.resp.status in RETRY_STATUS)
+            if not transient or retries >= MAX_RETRIES:
+                raise
+            retries += 1
+            wait = min(60, 2 ** retries) + random.random()
+            log(f"  Upload hiccup ({e.__class__.__name__}), retry {retries}/{MAX_RETRIES} in {wait:.0f}s")
+            time.sleep(wait)
+            continue
+        if chunk_status:
+            frac = chunk_status.progress()
+            log(f"  Upload progress: {int(frac * 100)}%")
+            if progress:
+                progress(frac)
 
     video_id = response["id"]
     url = f"https://youtu.be/{video_id}"
     log(f"  Upload complete: {url}")
+    if publish_at:
+        log(f"  Scheduled to go public at {publish_at}")
     return url
