@@ -173,7 +173,8 @@ def _worker():
                 _set_status(job_id, "BeatStars upload")
                 bs_url = upload_track(
                     job["path"], job["title"], bpm=render["bpm"], key=render["key"],
-                    visibility=job["privacy"], log=_log, should_stop=_stop.is_set)
+                    visibility=job["privacy"], tags=job["tags"], log=_log,
+                    should_stop=_stop.is_set)
                 with _lock:
                     _jobs[job_id]["beatstars_url"] = bs_url   # a retry won't re-upload
                 job["beatstars_url"] = bs_url
@@ -187,6 +188,7 @@ def _worker():
                     title=job["title"],
                     tags=job["tags"],
                     beatstars_url=job["beatstars_url"] or None,
+                    yt_title=job["yt_title"],
                     privacy=job["privacy"],
                     publish_at=_effective_publish_at(job),
                     delete_after_upload=job["delete_render"],
@@ -246,6 +248,29 @@ def _watchdog():
             _request_shutdown("no page open for 15 min and queue empty")
 
 
+def _last_scheduled():
+    """Latest scheduled publish time across YouTube and this app's queue."""
+    def parse(t):
+        return datetime.fromisoformat(t.replace("Z", "+00:00"))
+    with _lock:
+        cands = [(j["publish_at"], "queue") for j in _jobs.values()
+                 if j["publish_at"] and (j["status"] == "done" or _is_active(j["status"]))]
+    out = {"last": None, "source": None}
+    try:
+        from youtube_uploader import last_scheduled_publish
+        yt = last_scheduled_publish(log=_log)
+        if yt:
+            cands.append((yt, "youtube"))
+    except Exception as e:
+        out["error"] = f"couldn't read your YouTube schedule: {e}"
+        _log(f"  {out['error']}")
+    now = datetime.now(timezone.utc)
+    cands = [c for c in cands if parse(c[0]) > now]
+    if cands:
+        out["last"], out["source"] = max(cands, key=lambda c: parse(c[0]))
+    return out
+
+
 # ── HTTP handler ─────────────────────────────────────────────
 
 def _bad(msg):
@@ -280,11 +305,13 @@ class Handler(BaseHTTPRequestHandler):
                     "instance": _instance,
                     "jobs": {jid: {k: j[k] for k in (
                                 "status", "url", "filename", "title", "bpm", "producer",
-                                "beatstars_url", "publish_at", "skip_youtube")}
+                                "beatstars_url", "publish_at", "skip_youtube", "tags", "yt_title")}
                              for jid, j in _jobs.items()},
                     "log": list(_log_lines[-200:]),
                 }
             self._json(snapshot)
+        elif path == "/api/last_scheduled":
+            self._json(_last_scheduled())
         elif path == "/api/busy":           # used by the .app's quit handler
             self._send(str(_busy_count()), "text/plain")
         else:
@@ -350,6 +377,10 @@ class Handler(BaseHTTPRequestHandler):
         if beatstars and not beatstars.startswith(("http://", "https://")):
             _bad(f'BeatStars link for "{title}" isn\'t a URL')
 
+        yt_title = q.get("yt_title", "").strip() or None
+        if yt_title and (len(yt_title) > 100 or "<" in yt_title or ">" in yt_title):
+            _bad(f'YouTube title for "{title}" must be ≤100 characters with no < or >')
+
         publish_at = q.get("publish_at", "").strip() or None
         if publish_at:
             try:
@@ -381,6 +412,7 @@ class Handler(BaseHTTPRequestHandler):
             "producer": q.get("producer", "").strip() or "pk",
             "tags": [t.strip() for t in q.get("tags", "").split(",") if t.strip()],
             "beatstars_url": beatstars,
+            "yt_title": yt_title,
             "privacy": privacy if privacy in ("public", "unlisted", "private") else "public",
             "publish_at": publish_at,
             "scheme": scheme if scheme in COLOR_SCHEMES else None,
@@ -474,7 +506,14 @@ PAGE = r"""<!doctype html>
   }
   .detail input:focus { border-color: var(--acc1); }
   .detail input:disabled { color: var(--dim); background: transparent; }
-  .detail input.bs { flex: 1; min-width: 0; font-family: ui-monospace, "SF Mono", monospace; }
+  .detail input.bs { flex: 1.4; min-width: 0; font-family: ui-monospace, "SF Mono", monospace; }
+  .detail input.tags { flex: 1; min-width: 0; }
+  .detail input.yt { flex: 1; min-width: 0; font-family: ui-monospace, "SF Mono", monospace; }
+  .detail input.custom { border-color: var(--acc1); }
+  .detail .reset { background: none; border: 0; color: var(--acc2); cursor: pointer;
+                   font-size: 13px; padding: 0 2px; }
+  .detail .count { font: 10px ui-monospace, monospace; color: var(--dim); min-width: 44px; }
+  .detail .count.over { color: var(--err); }
   .detail input.bad { border-color: var(--err); }
   .detail label { font-size: 10px; letter-spacing: 1.5px; text-transform: uppercase;
                   color: var(--dim); }
@@ -569,7 +608,7 @@ PAGE = r"""<!doctype html>
   <button id="clearDone" hidden>Clear finished</button></div>
 <table id="queue">
   <thead><tr><th>File</th><th>Beat title</th><th style="width:64px">BPM</th>
-    <th style="width:110px">Producer</th><th style="width:170px">Status</th><th style="width:36px"></th></tr></thead>
+    <th style="width:150px" title="comma-separated, e.g. pk, frankii">Prod / co-prods</th><th style="width:170px">Status</th><th style="width:36px"></th></tr></thead>
   <tbody></tbody>
 </table>
 </div>
@@ -584,7 +623,8 @@ PAGE = r"""<!doctype html>
   <div class="span2"><label>Schedule — first beat at, then one every N days</label>
     <div class="row"><input type="datetime-local" id="schedStart">
       <input type="number" id="schedEvery" min="0" step="1" value="1" title="days between beats">
-      <button id="schedApply">Apply to beats</button></div></div>
+      <button id="schedApply">Apply to beats</button>
+      <button id="schedAfter" title="Start one interval after your last scheduled YouTube video (or queued beat)">⏭ After last scheduled</button></div></div>
 
   <div class="check"><input type="checkbox" id="bsUpload" checked><label for="bsUpload">Upload to BeatStars (beats without a link)</label>
     <button id="bsConnect" class="mini" title="Opens Chrome to log in to BeatStars">Connect BeatStars</button></div>
@@ -703,6 +743,7 @@ function addFiles(files) {
       file: f, name: f.name,
       title: parsed.title, bpm: parsed.bpm, producer: parsed.producer,
       beatstars: '', publishAt: '',
+      tags: null, ytTitle: null,          // null = follow shared tags / auto title
       jobId: null, status: 'ready', url: null,
     });
   }
@@ -715,6 +756,7 @@ function itemFromServer(jid, j) {
     file: null, name: j.filename, title: j.title, bpm: j.bpm, producer: j.producer,
     beatstars: j.beatstars_url || '',
     publishAt: j.publish_at ? toLocalInput(new Date(j.publish_at)) : '',
+    tags: (j.tags || []).join(', '), ytTitle: j.yt_title || null,
     jobId: jid, status: j.status, url: j.url,
   };
 }
@@ -745,6 +787,12 @@ function statusCell(it) {
   }
   return td;
 }
+
+// Per-beat values that follow the shared ones until edited
+const effTags = it => it.tags !== null ? it.tags : $('tags').value;
+const autoTitle = it => formatYtTitle(it.title, it.bpm, it.producer || 'pk', effTags(it));
+const effTitle = it => it.ytTitle !== null ? it.ytTitle : autoTitle(it);
+const badTitle = t => !t.trim() || t.length > 100 || /[<>]/.test(t);
 
 function render() {
   queueCard.hidden = items.length === 0;
@@ -785,10 +833,10 @@ function render() {
     tr.append(tdFile,
               cell(mkInput(it.title, 'Beat name…', v => { it.title = v; })),
               cell(mkInput(it.bpm, 'auto', v => { it.bpm = v; })),
-              cell(mkInput(it.producer, 'pk', v => { it.producer = v; })),
+              cell(mkInput(it.producer, 'pk, co-prod…', v => { it.producer = v; })),
               it.statusTd, tdAct);
 
-    // Detail row: per-beat BeatStars link + publish time, then the title preview
+    // Detail rows: BeatStars link + tags + publish time, then the editable YouTube title
     const trD = document.createElement('tr');
     trD.className = 'detailRow';
     const tdD = document.createElement('td');
@@ -816,26 +864,61 @@ function render() {
     pubLabel.textContent = 'Publish';
     const pub = mkInput(it.publishAt, '', v => { it.publishAt = v; }, 'datetime-local');
     pub.title = 'blank = publish as soon as uploaded';
-    line.append(bs, pubLabel, pub);
+
+    // A small ↺ that drops a per-beat override back to the shared/auto value
+    const mkReset = (title, onReset) => {
+      const b = document.createElement('button');
+      b.className = 'reset'; b.textContent = '↺'; b.title = title;
+      b.onclick = e => { e.preventDefault(); onReset(); it.updatePreview(); };
+      return b;
+    };
+    const tagsInp = mkInput(effTags(it), 'tags for this beat', v => { it.tags = v; });
+    tagsInp.className = 'tags';
+    tagsInp.title = 'Tags for this beat (title, YouTube tags, description). Starts as the shared tags.';
+    const tagsReset = mkReset('use the shared tags again', () => { it.tags = null; });
+    line.append(bs, tagsInp, tagsReset, pubLabel, pub);
+
+    // Editable YouTube title: auto-generated until you type in it
+    const line2 = document.createElement('div');
+    line2.className = 'detail';
+    const ytLabel = document.createElement('label');
+    ytLabel.textContent = 'YT title';
+    const ytInp = mkInput(effTitle(it), '', v => { it.ytTitle = v; });
+    ytInp.className = 'yt';
+    ytInp.title = 'Edit to override the generated YouTube title (max 100 chars, no < >)';
+    const ytReset = mkReset('back to the auto-generated title', () => { it.ytTitle = null; });
+    const count = document.createElement('span');
+    count.className = 'count';
+    line2.append(ytLabel, ytInp, ytReset, count);
 
     const prev = document.createElement('div');
     prev.className = 'preview';
     it.updatePreview = () => {
+      // Follow shared values unless overridden (never fight the user's typing)
+      const tagsCustom = it.tags !== null, ytCustom = it.ytTitle !== null;
+      if (!tagsCustom && document.activeElement !== tagsInp) tagsInp.value = effTags(it);
+      if (!ytCustom && document.activeElement !== ytInp) ytInp.value = autoTitle(it);
+      tagsInp.classList.toggle('custom', tagsCustom);
+      ytInp.classList.toggle('custom', ytCustom);
+      tagsReset.hidden = !tagsCustom || locked;
+      ytReset.hidden = !ytCustom || locked;
+      const t = effTitle(it);
+      count.textContent = t.length + '/100';
+      count.classList.toggle('over', badTitle(t));
+      ytInp.classList.toggle('bad', badTitle(t));
+
       prev.innerHTML = '';
-      const label = document.createElement('b');
-      label.textContent = 'YT title → ';
-      prev.append(label, formatYtTitle(it.title, it.bpm, it.producer || 'pk', $('tags').value));
       const add = (cls, text) => {
         const s = document.createElement('span'); s.className = cls; s.textContent = text; prev.append(s);
       };
-      if (it.publishAt) add('sched', '  ·  ⏰ ' + fmtWhen(it.publishAt) + ' (private until then)');
+      if (it.publishAt) add('sched', '⏰ ' + fmtWhen(it.publishAt) + ' (private until then)  ');
       if (!it.beatstars && $('bsUpload').checked)
-        add('sched', '  ·  ↑ BeatStars upload, link added automatically');
+        add('sched', '↑ BeatStars upload, link added automatically');
       else if (!it.beatstars && !$('defBeatstars').value.trim() && !$('skip').checked)
-        add('warn', '  ·  no BeatStars link');
+        add('warn', 'no BeatStars link');
     };
     it.updatePreview();
-    tdD.append(line, prev);
+    tdD.append(line, line2, prev);
     trD.appendChild(tdD);
     tbody.append(tr, trD);
   });
@@ -859,7 +942,7 @@ drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
 drop.ondragleave = () => drop.classList.remove('over');
 drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); addFiles(e.dataTransfer.files); };
 
-$('schedApply').onclick = () => {
+function applySchedule() {
   const targets = items.filter(it => !it.jobId);
   if (!targets.length) { clientLog('add beats first, then apply the schedule'); return; }
   const start = $('schedStart').value;
@@ -876,6 +959,33 @@ $('schedApply').onclick = () => {
     clientLog(`scheduled ${targets.length} beat(s) from ${fmtWhen(start)}, every ${every} day(s)`);
   }
   render();
+}
+$('schedApply').onclick = applySchedule;
+
+$('schedAfter').onclick = async () => {
+  if (!items.some(it => !it.jobId)) { clientLog('add beats first, then schedule them'); return; }
+  const btn = $('schedAfter');
+  btn.disabled = true;
+  clientLog('looking up your last scheduled upload… (first time: approve read access in the Google window)');
+  try {
+    const r = await (await fetch('/api/last_scheduled')).json();
+    if (r.error) clientLog(r.error);
+    if (!r.last) {
+      clientLog('nothing scheduled after now — pick a start time and press Apply');
+      return;
+    }
+    const every = Math.max(1, Math.round(+$('schedEvery').value || 1));
+    const d = new Date(r.last);
+    d.setDate(d.getDate() + every);            // same time of day, N days later
+    $('schedStart').value = toLocalInput(d);
+    clientLog(`last scheduled: ${fmtWhen(r.last)} (${r.source === 'queue' ? 'queued here' : 'YouTube'})`
+              + ` — new beats start ${fmtWhen(d)}, every ${every} day(s)`);
+    applySchedule();
+  } catch (e) {
+    clientLog('schedule lookup failed: ' + e.message);
+  } finally {
+    btn.disabled = false;
+  }
 };
 
 startBtn.onclick = async () => {
@@ -892,6 +1002,8 @@ startBtn.onclick = async () => {
   for (const it of pending) {
     const link = it.beatstars || defLink;
     if (link && !URL_RE.test(link)) problems.push(`"${it.title}": BeatStars link isn't a URL`);
+    if (!skip && badTitle(effTitle(it)))
+      problems.push(`"${it.title}": YouTube title must be 1–100 characters, no < or >`);
     if (!skip && it.publishAt && new Date(it.publishAt) <= new Date())
       problems.push(`"${it.title}": publish time is in the past`);
   }
@@ -905,7 +1017,8 @@ startBtn.onclick = async () => {
         title: it.title,
         bpm: it.bpm || '',
         producer: it.producer || '',
-        tags: $('tags').value,
+        tags: effTags(it),
+        yt_title: it.ytTitle !== null ? it.ytTitle.trim() : '',
         beatstars: it.beatstars || (bsUp ? '' : defLink),
         bs: bsUp ? '1' : '',
         privacy: $('privacy').value,

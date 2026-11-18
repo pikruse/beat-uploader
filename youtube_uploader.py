@@ -25,7 +25,9 @@ from google.oauth2.credentials import Credentials
 
 CLIENT_SECRET = "auth/client_secret.json"
 TOKEN_CACHE = "auth/token.json"
-SCOPES = ["https://www.googleapis.com/auth/youtube.upload"]
+SCOPE_UPLOAD = "https://www.googleapis.com/auth/youtube.upload"
+SCOPE_READ = "https://www.googleapis.com/auth/youtube.readonly"
+SCOPES = [SCOPE_UPLOAD]
 
 # Transient failures worth retrying a chunk for (Google's recommended set)
 RETRY_STATUS = {500, 502, 503, 504}
@@ -36,12 +38,22 @@ class UploadCancelled(Exception):
     pass
 
 
-def _get_authenticated_service(log=print):
-    """Return an authorized YouTube API service object."""
-    creds = None
+def _get_authenticated_service(log=print, need=(SCOPE_UPLOAD,)):
+    """Return an authorized YouTube API service object.
 
+    need: scopes this call requires. If the cached token lacks one (e.g. the
+    read-only scope for looking up scheduled videos), the browser consent
+    opens once for the combined set; uploads never trigger that.
+    """
+    creds = None
     if os.path.exists(TOKEN_CACHE):
-        creds = Credentials.from_authorized_user_file(TOKEN_CACHE, SCOPES)
+        creds = Credentials.from_authorized_user_file(TOKEN_CACHE)
+    have = set(creds.scopes or []) if creds else set()
+
+    if creds and not set(need) <= have:
+        log("  YouTube: asking for read access (to see your scheduled videos) — "
+            "approve it in the browser window")
+        creds = None
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
@@ -58,7 +70,8 @@ def _get_authenticated_service(log=print):
                     f"Missing {CLIENT_SECRET}. Download OAuth client JSON from "
                     "Google Cloud Console and place it in auth/."
                 )
-            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET, SCOPES)
+            scopes = sorted(have | set(need) | {SCOPE_UPLOAD})
+            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET, scopes)
             creds = flow.run_local_server(port=0)
 
         os.makedirs(os.path.dirname(TOKEN_CACHE), exist_ok=True)
@@ -66,6 +79,32 @@ def _get_authenticated_service(log=print):
             f.write(creds.to_json())
 
     return build("youtube", "v3", credentials=creds)
+
+
+def last_scheduled_publish(log=print, recent=50):
+    """Latest future publishAt among your most recent uploads (scheduled
+    videos are private with a publish time), as an RFC 3339 string, or None."""
+    from datetime import datetime, timezone
+    yt = _get_authenticated_service(log=log, need=(SCOPE_UPLOAD, SCOPE_READ))
+    chan = yt.channels().list(part="contentDetails", mine=True).execute()
+    if not chan.get("items"):
+        return None
+    uploads = chan["items"][0]["contentDetails"]["relatedPlaylists"]["uploads"]
+    items = yt.playlistItems().list(part="contentDetails", playlistId=uploads,
+                                    maxResults=min(recent, 50)).execute().get("items", [])
+    ids = [it["contentDetails"]["videoId"] for it in items]
+    if not ids:
+        return None
+    now = datetime.now(timezone.utc)
+    best = None
+    for v in yt.videos().list(part="status", id=",".join(ids)).execute().get("items", []):
+        at = v.get("status", {}).get("publishAt")
+        if not at:
+            continue
+        when = datetime.fromisoformat(at.replace("Z", "+00:00"))
+        if when > now and (best is None or when > best):
+            best = when
+    return best.strftime("%Y-%m-%dT%H:%M:%SZ") if best else None
 
 
 def upload_video(

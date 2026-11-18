@@ -37,16 +37,26 @@ upload" (on by default — the mp4 is removed once YouTube has it).
 - **BeatStars upload:** with "Upload to BeatStars" on (default), each beat
   without a link is published to BeatStars after it renders — mp3 master,
   title, detected BPM + key, same visibility as YouTube; BeatStars' autofill
-  and your account defaults handle genre/moods/tags/license prices. The new
-  link goes into the YouTube description. A Chrome window shows for ~1 min
-  per beat while it does this (BeatStars blocks hidden/headless browsers).
+  and your account defaults handle genre/moods/license prices. The new
+  link goes into the YouTube description. BeatStars' Tags get the beat's
+  own tags (first 3 — BeatStars' limit). Chrome runs in the background with
+  its window minimized off-screen, so nothing pops up or steals focus
+  (`python beatstars_uploader.py --upload … --show` to watch it).
   First time, or when it says the login expired: click **Connect BeatStars**
   (or `python beatstars_uploader.py --login`). BeatStars needs 320 kbps mp3s;
   lower-bitrate files are converted automatically.
+- **Per-beat tags, title, co-prods:** each beat has its own Tags box (starts
+  as the shared tags and follows them until you edit it) and an editable
+  **YT title** line (auto-generated until you type in it; ↺ resets either).
+  Co-producers go in the "Prod / co-prods" column, comma-separated —
+  `pk, frankii` becomes "prod pk and frankii".
 - **Batch links:** copy several BeatStars links (one per line) and paste them
   into the first row's link box — they fill down the rows in order.
 - **Scheduling:** set "first beat at" + "every N days" and hit *Apply to
-  beats*, or set times per row. Scheduled beats upload as private and YouTube
+  beats*, or set times per row. **⏭ After last scheduled** continues from
+  your latest scheduled YouTube video (or beat already queued in the app):
+  first new beat N days after it, same time of day. The first time, Google
+  asks once for read-only YouTube access so the app can see your schedule. Scheduled beats upload as private and YouTube
   publishes them at that time.
 - **Set and forget:** after Start you can close the tab. Beats keep
   processing (the Mac is kept awake, a notification fires per beat) and the

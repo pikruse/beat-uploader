@@ -15,6 +15,10 @@ What it fills: the master mp3, title, BPM, key and visibility. Everything
 else (genres, moods, instruments, tags, license prices) is left to
 BeatStars' own autofill and your account defaults, same as uploading by hand.
 
+Uploads run in a real Chrome that's started in the background (window-less,
+then a minimized off-screen window), so nothing pops up or steals focus.
+BeatStars refuses headless Chrome, and we don't disguise it as anything else.
+
 This depends on BeatStars' page layout, so a redesign on their side can break
 it — failures save a screenshot to ~/Library/Logs/ for debugging.
 """
@@ -23,6 +27,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -116,17 +121,106 @@ def key_option_values(key):
 
 # ── Browser helpers ──────────────────────────────────────────
 
-def _launch(p, headless):
+CHROME_APP = "Google Chrome"
+# Chrome flags Playwright normally adds that matter here: keep automation
+# visible to the site (we don't hide that it's automated) and don't throttle
+# a window that's minimized/off-screen.
+_BG_FLAGS = ["--enable-automation", "--no-first-run", "--no-default-browser-check",
+             "--disable-background-timer-throttling", "--disable-renderer-backgrounding",
+             "--disable-backgrounding-occluded-windows", "--password-store=basic",
+             "--use-mock-keychain", "--disable-sync"]
+_procs = {}   # id(ctx) -> how to shut that Chrome down
+
+
+def _free_port():
+    import socket
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _launch(p, hidden):
+    """A real (headed) Chrome on the BeatStars profile — Studio refuses
+    headless ones.
+
+    hidden=True: Chrome is started with `open -g` (macOS launches it without
+    bringing it to the front, so it never steals focus or keystrokes), its
+    window parked off-screen and minimized; Playwright attaches over a
+    localhost-only DevTools port. hidden=False shows a normal window."""
     os.makedirs(PROFILE, exist_ok=True)
-    ctx = p.chromium.launch_persistent_context(
-        PROFILE, channel="chrome", headless=headless,
-        viewport={"width": 1400, "height": 950})
+    if hidden and sys.platform == "darwin":
+        port = _free_port()
+        # --no-startup-window: Chrome activates itself when its first window
+        # appears, even under `open -g`. Starting window-less and creating the
+        # window over DevTools as a *background* window avoids that entirely.
+        subprocess.run(["open", "-g", "-n", "-a", CHROME_APP, "--args",
+                        f"--user-data-dir={PROFILE}", f"--remote-debugging-port={port}",
+                        "--remote-debugging-address=127.0.0.1", "--no-startup-window",
+                        "--window-position=-3000,-3000", "--window-size=1400,950",
+                        *_BG_FLAGS], check=True)
+        browser = None
+        for _ in range(60):                      # wait for DevTools to come up
+            try:
+                browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+                break
+            except Exception:
+                time.sleep(0.25)
+        if browser is None:
+            _kill_profile_chrome()
+            raise BeatStarsError("couldn't start Chrome in the background")
+        ctx = browser.contexts[0]
+        try:
+            bcdp = browser.new_browser_cdp_session()
+            with ctx.expect_page() as new_page:
+                target = bcdp.send("Target.createTarget", {
+                    "url": "about:blank", "newWindow": True, "background": True})
+            new_page.value
+            win = bcdp.send("Browser.getWindowForTarget", {"targetId": target["targetId"]})["windowId"]
+            bcdp.send("Browser.setWindowBounds", {"windowId": win, "bounds": {
+                "left": -3000, "top": -3000, "width": 1400, "height": 950}})
+            bcdp.send("Browser.setWindowBounds", {"windowId": win, "bounds": {"windowState": "minimized"}})
+        except Exception:
+            if not ctx.pages:
+                _procs[id(ctx)] = browser
+                _close(ctx)
+                raise BeatStarsError("couldn't open a background Chrome window")
+        _procs[id(ctx)] = browser
+    else:
+        ctx = p.chromium.launch_persistent_context(
+            PROFILE, channel="chrome", headless=False, args=["--window-size=1400,950"],
+            viewport={"width": 1400, "height": 950})
     try:
         with open(STATE) as f:
             ctx.add_cookies(json.load(f))
     except (OSError, ValueError):
         pass
     return ctx
+
+
+def _kill_profile_chrome():
+    subprocess.run(["pkill", "-f", f"user-data-dir={PROFILE}"], capture_output=True)
+
+
+def _close(ctx):
+    """Shut down the Chrome behind ctx (whichever way it was launched)."""
+    browser = _procs.pop(id(ctx), None)
+    if browser is None:
+        ctx.close()
+        return
+    try:
+        browser.new_browser_cdp_session().send("Browser.close")
+    except Exception:
+        pass
+    try:
+        browser.close()
+    except Exception:
+        pass
+    for _ in range(40):                          # make sure it's really gone
+        if subprocess.run(["pgrep", "-f", f"user-data-dir={PROFILE}"],
+                          capture_output=True).returncode != 0:
+            return
+        time.sleep(0.25)
+    _kill_profile_chrome()
 
 
 def _save_cookies(ctx):
@@ -218,6 +312,35 @@ def _add_genre(page, genre):
         raise BeatStarsError(f"couldn't set the genre '{genre}'")
 
 
+MAX_TAGS = 3   # BeatStars' limit
+
+
+def _set_tags(page, tags, log=print):
+    """Replace BeatStars' autofilled/default tags with ours (first 3)."""
+    tags = [t.strip() for t in tags if t and t.strip()][:MAX_TAGS]
+    if not tags:
+        return
+    grid = page.locator("label:text-is('Tags')").locator(
+        "xpath=ancestor::*[.//mat-chip-grid][1]").locator("mat-chip-grid").first
+    chips = grid.locator("mat-chip-row")
+    for _ in range(10):                       # remove existing chips
+        if not chips.count():
+            break
+        chips.first.locator("[aria-label='Remove']").first.click()
+        page.wait_for_timeout(300)
+    if chips.count():
+        raise BeatStarsError("couldn't clear BeatStars' default tags")
+    inp = grid.locator("input").first
+    for t in tags:
+        inp.click()
+        inp.type(t, delay=20)
+        inp.press("Enter")
+        page.wait_for_timeout(300)
+    got = [c.inner_text().strip() for c in chips.all()]
+    if {g.lower() for g in got} != {t.lower() for t in tags}:
+        log(f"  BeatStars: tags came out as {got} (wanted {tags})")
+
+
 def _delete_track(page, track_num, log=print):
     """Delete a track (used to clean up a half-created draft after a failure)."""
     page.goto(TRACKS, wait_until="domcontentloaded")
@@ -256,14 +379,14 @@ def login(log=print, timeout_s=1200):
     """Open a visible Chrome on BeatStars Studio's login and wait for you."""
     from playwright.sync_api import sync_playwright
     with _profile_lock, sync_playwright() as p:
-        ctx = _launch(p, headless=False)
+        ctx = _launch(p, hidden=False)        # you need to see this one
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(TRACKS)        # not logged in → Studio redirects to its login
         page.wait_for_timeout(4000)
         if _logged_in(page):
             _save_cookies(ctx)
             log("  BeatStars already connected")
-            ctx.close()
+            _close(ctx)
             return True
         log("  Log in to BeatStars in the Chrome window that just opened…")
         deadline = time.time() + timeout_s
@@ -291,17 +414,19 @@ def login(log=print, timeout_s=1200):
                     page.goto(TRACKS)
             raise BeatStarsLoginRequired("timed out waiting for the BeatStars login")
         finally:
-            ctx.close()
+            _close(ctx)
 
 
 def upload_track(audio_path, title, bpm=None, key=None, visibility="public",
-                 genre="Hip Hop", headless=False, log=print, should_stop=None):
+                 genre="Hip Hop", tags=None, hidden=True, log=print, should_stop=None):
     """Create and publish a BeatStars track. Returns its share link
     (https://bsta.rs/…, or the full beatstars.com/beat/… URL as a fallback).
 
-    headless=False by default: BeatStars Studio refuses logins from headless
-    Chrome, so a Chrome window shows while it uploads (~1 min per beat).
+    hidden=True: BeatStars Studio refuses logins from headless Chrome, so this
+    runs a real Chrome window but keeps it minimized/off-screen and gives
+    focus back to your app. hidden=False shows it (handy for debugging).
     genre: used only if BeatStars' autofill leaves Genres empty (required).
+    tags:  replace BeatStars' autofilled tags with these (it keeps max 3).
     """
     from playwright.sync_api import sync_playwright
 
@@ -315,7 +440,7 @@ def upload_track(audio_path, title, bpm=None, key=None, visibility="public",
     log(f"  BeatStars: uploading {title}")
     try:
         with _profile_lock, sync_playwright() as p:
-            ctx = _launch(p, headless=headless)
+            ctx = _launch(p, hidden=hidden)
             page = ctx.pages[0] if ctx.pages else ctx.new_page()
             page.set_default_timeout(30000)
             track_num = None
@@ -371,6 +496,8 @@ def upload_track(audio_path, title, bpm=None, key=None, visibility="public",
                             sel.select_option(v)
                             break
                 page.locator("select:has(option[value='PRIVATE'])").first.select_option(visibility)
+                if tags:
+                    _set_tags(page, tags, log=log)
                 check_stop()
 
                 # The master can still be finishing server-side ("main audio
@@ -425,7 +552,7 @@ def upload_track(audio_path, title, bpm=None, key=None, visibility="public",
                                      f"{str(e).splitlines()[0][:200]}"
                                      + (f" (screenshot: {shot})" if shot else "")) from e
             finally:
-                ctx.close()
+                _close(ctx)
     finally:
         if tmpdir:
             import shutil
@@ -442,11 +569,13 @@ if __name__ == "__main__":
     ap.add_argument("--key")
     ap.add_argument("--visibility", default="public", choices=["public", "unlisted", "private"])
     ap.add_argument("--genre", default="Hip Hop", help="fallback genre if autofill leaves it empty")
+    ap.add_argument("--show", action="store_true", help="show the Chrome window while uploading")
     a = ap.parse_args()
     if a.login:
         login()
     elif a.upload:
         print(upload_track(a.upload, a.title or os.path.splitext(os.path.basename(a.upload))[0],
-                           bpm=a.bpm, key=a.key, visibility=a.visibility, genre=a.genre))
+                           bpm=a.bpm, key=a.key, visibility=a.visibility, genre=a.genre,
+                           hidden=not a.show))
     else:
         ap.print_help()

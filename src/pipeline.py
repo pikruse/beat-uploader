@@ -92,6 +92,7 @@ def upload_beat(
     title,
     tags=None,
     beatstars_url=None,
+    yt_title=None,
     privacy="public",
     publish_at=None,
     delete_after_upload=False,
@@ -101,12 +102,15 @@ def upload_beat(
 ):
     """Upload a render_beat() result to YouTube. Returns the video URL.
 
+    yt_title:            override the generated YouTube title.
     publish_at:          RFC 3339 UTC string — schedule instead of publishing now.
     delete_after_upload: remove the local mp4 once YouTube has it.
     """
     tag_list = list(tags) if tags else []
     producer = render["producer"]
-    yt_title = format_youtube_title(title, producer, render["bpm"], tags=tag_list)
+    # A hand-edited title wins; YouTube rejects < > and anything over 100 chars
+    yt_title = (yt_title or "").replace("<", "").replace(">", "").strip()[:100] \
+        or format_youtube_title(title, producer, render["bpm"], tags=tag_list)
     yt_description = generate_description(
         title=title, producer=producer, bpm=render["bpm"], key=render["key"],
         beatstars_url=beatstars_url or "", tags=tag_list,
